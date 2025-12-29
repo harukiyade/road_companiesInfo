@@ -36,3 +36,6 @@ csv/
 
 # mac / Cloud sync duplicate files
 * 2.*
+
+# track lock file
+!package-lock.json
