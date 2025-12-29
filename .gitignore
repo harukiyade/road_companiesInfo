@@ -30,3 +30,7 @@ logs/
 node_modules/
 out/
 *.log
+
+# track csv directory
+!csv/
+!csv/**
