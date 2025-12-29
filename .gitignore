@@ -1,41 +1,59 @@
-cat >> .gitignore << 'EOF'
-
+# .gitignore を「上書き」で修正（package.json / tsconfig.json / package-lock.json は追跡OKにする）
+cat > .gitignore << 'EOF'
 # ---- MUST ignore secrets ----
 **/*firebase-adminsdk*.json
 **/*serviceAccount*.json
+**/*service-account*.json
+**/*service_account*.json
+
+# ---- macOS / Cloud sync ----
+.DS_Store
+._*
+* 2.*
+
+# ---- Node ----
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
 # ---- Python / venv ----
 venv/
 .venv/
 __pycache__/
-*.pyc
+*.py[cod]
 
-# ---- Data / outputs (too many) ----
-*.json
+# ---- build / output ----
+dist/
+build/
+out/
+coverage/
+logs/
+edinet_downloads/
+null_fields_detailed/
+
+# ---- huge datasets ----
+csv/
+
+# ---- generated artifacts (keep repo light) ----
+*.log
 *.csv
 *.txt
-
-# ---- images (optional) ----
 *.png
-EOF
-# allow specific files
-!FIELD_MAPPING_TABLE.csv
+*.json
 
-# local-only / big files
-.DS_Store
-.env
-.env.example
-csv/
-logs/
-node_modules/
-out/
-*.log
-
-# re-ignore huge csv dataset
-csv/
-
-# mac / Cloud sync duplicate files
-* 2.*
-
-# track lock file
+# ---- allow tracked files ----
+!package.json
 !package-lock.json
+!tsconfig.json
+!FIELD_MAPPING_TABLE.csv
+EOF
+
+# 確認（package.json が NOT_IGNORED になっていればOK）
+git check-ignore -v package.json package-lock.json tsconfig.json || echo "OK: not ignored"
+
+# 反映
+git add .gitignore
+git commit -m "Fix .gitignore (track package.json/lock/tsconfig)"
+git push
