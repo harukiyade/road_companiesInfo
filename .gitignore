@@ -57,3 +57,6 @@ git check-ignore -v package.json package-lock.json tsconfig.json || echo "OK: no
 git add .gitignore
 git commit -m "Fix .gitignore (track package.json/lock/tsconfig)"
 git push
+# secrets / local env
+.env
+.env.*
