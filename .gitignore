@@ -33,3 +33,6 @@ out/
 
 # re-ignore huge csv dataset
 csv/
+
+# mac / Cloud sync duplicate files
+* 2.*
