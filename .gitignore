@@ -15,3 +15,13 @@ null_fields_detailed/
 *.png
 *.log
 *.txt
+
+# allow required CSVs (override ignore)
+!companies_webinfo.csv
+!companies_new_fields_list.csv
+
+# keep repo light
+node_modules/
+logs/
+edinet_downloads/
+null_fields_detailed/
