@@ -1,0 +1,170 @@
+companies_new フィールド,マッピング元（CSVヘッダー例）,カテゴリー,データ型
+name,"会社名, 企業名, 商号",基本情報,string
+nameEn,"会社名（英語）, nameEn",基本情報,string
+kana,"カナ, フリガナ",基本情報,string
+corporateNumber,"法人番号, corporate_number",基本情報,string
+corporationType,"法人種別, 会社種別",基本情報,string
+nikkeiCode,日経コード,基本情報,string
+badges,バッジ（配列）,基本情報,array
+tags,タグ（配列）,基本情報,array
+createdAt,作成日時,基本情報,timestamp
+updatedAt,更新日時,基本情報,timestamp
+updateDate,更新日,基本情報,string
+updateCount,更新回数,基本情報,number
+changeCount,変更回数,基本情報,number
+qualificationGrade,資格等級,基本情報,string
+prefecture,"都道府県, pref",所在地情報,string
+address,"会社住所, 住所, 所在地, 本社所在地, 本社住所",所在地情報,string
+headquartersAddress,"本社所在地, 本社住所",所在地情報,string
+postalCode,"会社郵便番号, 郵便番号",所在地情報,string
+location,"立地, 所在地",所在地情報,string
+departmentLocation,部署所在地,所在地情報,string
+phoneNumber,"電話番号, 代表電話, phone, tel",連絡先情報,string
+contactPhoneNumber,"電話番号(窓口), 窓口電話番号, 問い合わせ電話番号",連絡先情報,string
+fax,"FAX, FAX番号",連絡先情報,string
+email,"メールアドレス, E-mail, mail",連絡先情報,string
+companyUrl,"URL, 企業ホームページURL, HP",連絡先情報,string
+contactFormUrl,"お問い合わせURL, 問い合わせフォームURL",連絡先情報,string
+representativeName,"代表者名, 代表者, 代表取締役名, 代表名（134.csv）",代表者情報,string
+representativeKana,"代表者カナ, 代表者フリガナ",代表者情報,string
+representativeTitle,"代表者役職, 役職, 肩書",代表者情報,string
+representativeBirthDate,"代表者誕生日, 生年月日",代表者情報,string
+representativePhone,"代表者電話番号, 代表電話",代表者情報,string
+representativePostalCode,代表者郵便番号,代表者情報,string
+representativeHomeAddress,"代表者住所, 代表者自宅住所",代表者情報,string
+representativeRegisteredAddress,代表者登録住所,代表者情報,string
+representativeAlmaMater,"代表者出身校, 出身大学",代表者情報,string
+executives,"取締役, 役員（テキスト形式）",代表者情報,string
+executiveName1,"役員名1, executiveName1",役員情報,string
+executivePosition1,"役職1, executivePosition1, executiveTitle1",役員情報,string
+executiveName2,"役員名2, executiveName2",役員情報,string
+executivePosition2,"役職2, executivePosition2, executiveTitle2",役員情報,string
+executiveName3,"役員名3, executiveName3",役員情報,string
+executivePosition3,"役職3, executivePosition3, executiveTitle3",役員情報,string
+executiveName4,"役員名4, executiveName4",役員情報,string
+executivePosition4,"役職4, executivePosition4, executiveTitle4",役員情報,string
+executiveName5,"役員名5, executiveName5",役員情報,string
+executivePosition5,"役職5, executivePosition5, executiveTitle5",役員情報,string
+executiveName6,"役員名6, executiveName6",役員情報,string
+executivePosition6,"役職6, executivePosition6, executiveTitle6",役員情報,string
+executiveName7,"役員名7, executiveName7",役員情報,string
+executivePosition7,"役職7, executivePosition7, executiveTitle7",役員情報,string
+executiveName8,"役員名8, executiveName8",役員情報,string
+executivePosition8,"役職8, executivePosition8, executiveTitle8",役員情報,string
+executiveName9,"役員名9, executiveName9",役員情報,string
+executivePosition9,"役職9, executivePosition9, executiveTitle9",役員情報,string
+executiveName10,"役員名10, executiveName10",役員情報,string
+executivePosition10,"役職10, executivePosition10, executiveTitle10",役員情報,string
+industry,業種,業種情報,string
+industryLarge,"業種-大, 業種（大）, 業種1（130.csv含む）",業種情報,string
+industryMiddle,"業種-中, 業種（中）, 業種2（130.csv含む）",業種情報,string
+industrySmall,"業種-小, 業種（小）, 業種3（130.csv含む）",業種情報,string
+industryDetail,"業種-細, 業種（細）, 業種4",業種情報,string
+industries,業種リスト（配列）,業種情報,array
+industryCategories,"ジャンル, 業種カテゴリー",業種情報,string
+businessDescriptions,"営業種目, 事業内容, 得意分野",業種情報,string
+businessItems,事業品目（配列）,業種情報,array
+businessSummary,事業概要,業種情報,string
+specialties,専門分野,業種情報,string
+demandProducts,需要製品,業種情報,string
+specialNote,特記事項,業種情報,string
+capitalStock,資本金,財務情報,number
+revenue,"売上高, 売上, sales",財務情報,number
+latestRevenue,直近売上,財務情報,number
+latestProfit,"直近利益, 経常利益",財務情報,number
+revenueFromStatements,財務諸表売上,財務情報,number
+operatingIncome,営業利益,財務情報,number
+totalAssets,総資産,財務情報,number
+totalLiabilities,総負債,財務情報,number
+netAssets,純資産,財務情報,number
+issuedShares,発行済株式数,財務情報,number
+financials,財務情報,財務情報,string
+listing,"上場, 上場区分",財務情報,string
+marketSegment,市場区分,財務情報,string
+latestFiscalYearMonth,直近決算年月,財務情報,string
+fiscalMonth,"決算期, 決算月",財務情報,string
+fiscalMonth1,決算月1,財務情報,string
+fiscalMonth2,決算月2,財務情報,string
+fiscalMonth3,決算月3,財務情報,string
+fiscalMonth4,決算月4,財務情報,string
+fiscalMonth5,決算月5,財務情報,string
+revenue1,売上1,財務情報,number
+revenue2,売上2,財務情報,number
+revenue3,売上3,財務情報,number
+revenue4,売上4,財務情報,number
+revenue5,売上5,財務情報,number
+profit1,利益1,財務情報,number
+profit2,利益2,財務情報,number
+profit3,利益3,財務情報,number
+profit4,利益4,財務情報,number
+profit5,利益5,財務情報,number
+employeeCount,"従業員数, 社員数, employees",企業規模・組織,number
+employeeNumber,従業員番号,企業規模・組織,number
+factoryCount,工場数,企業規模・組織,number
+officeCount,"オフィス数, 事業所数",企業規模・組織,number
+storeCount,店舗数,企業規模・組織,number
+averageAge,平均年齢,企業規模・組織,string
+averageYearsOfService,平均勤続年数,企業規模・組織,string
+averageOvertimeHours,平均残業時間,企業規模・組織,string
+averagePaidLeave,平均有給取得日数,企業規模・組織,string
+femaleExecutiveRatio,女性役員比率,企業規模・組織,string
+established,"設立, 設立年月日",設立・沿革,string
+dateOfEstablishment,設立日,設立・沿革,string
+founding,"創業, 創業年, founded",設立・沿革,string
+foundingYear,創業年,設立・沿革,string
+acquisition,買収情報,設立・沿革,string
+clients,"取引先, 主要取引先, 子会社・関連会社",取引先・関係会社,string
+suppliers,"仕入れ先, 取引先銀行（配列）",取引先・関係会社,array
+subsidiaries,子会社（配列）,取引先・関係会社,array
+affiliations,"関連会社, 提携先",取引先・関係会社,string
+shareholders,"株主, 主要株主, 株式保有率",取引先・関係会社,string
+banks,"銀行, 取引銀行（配列）",取引先・関係会社,array
+bankCorporateNumber,銀行法人番号,取引先・関係会社,string
+departmentName1,"部署名1, 事業所名1",部署・拠点情報,string
+departmentAddress1,"部署住所1, 事業所住所1",部署・拠点情報,string
+departmentPhone1,"部署電話番号1, 事業所電話1",部署・拠点情報,string
+departmentName2,部署名2,部署・拠点情報,string
+departmentAddress2,部署住所2,部署・拠点情報,string
+departmentPhone2,部署電話番号2,部署・拠点情報,string
+departmentName3,部署名3,部署・拠点情報,string
+departmentAddress3,部署住所3,部署・拠点情報,string
+departmentPhone3,部署電話番号3,部署・拠点情報,string
+departmentName4,部署名4,部署・拠点情報,string
+departmentAddress4,部署住所4,部署・拠点情報,string
+departmentPhone4,部署電話番号4,部署・拠点情報,string
+departmentName5,部署名5,部署・拠点情報,string
+departmentAddress5,部署住所5,部署・拠点情報,string
+departmentPhone5,部署電話番号5,部署・拠点情報,string
+departmentName6,部署名6,部署・拠点情報,string
+departmentAddress6,部署住所6,部署・拠点情報,string
+departmentPhone6,部署電話番号6,部署・拠点情報,string
+departmentName7,部署名7,部署・拠点情報,string
+departmentAddress7,部署住所7,部署・拠点情報,string
+departmentPhone7,部署電話番号7,部署・拠点情報,string
+overview,"概況, 概要",企業説明,string
+companyDescription,"説明, 会社情報・備考",企業説明,string
+businessDescriptions,"営業種目, 事業内容, 得意分野",企業説明,string
+salesNotes,"備考, 営業メモ",企業説明,string
+urls,URL配列,SNS・外部リンク,array
+profileUrl,プロフィールURL,SNS・外部リンク,string
+externalDetailUrl,外部詳細URL,SNS・外部リンク,string
+facebook,Facebook URL,SNS・外部リンク,string
+linkedin,LinkedIn URL,SNS・外部リンク,string
+wantedly,Wantedly URL,SNS・外部リンク,string
+youtrust,YOUTRUST URL,SNS・外部リンク,string
+metaKeywords,メタキーワード,SNS・外部リンク,string
+metaDescription,メタ説明,SNS・外部リンク,string
+tradingStatus,"取引可否, 取引状況, 取引ステータス",取引状態・内部管理,string
+adExpiration,広告有効期限,取引状態・内部管理,string
+numberOfActivity,活動回数,取引状態・内部管理,number
+transportation,交通手段,取引状態・内部管理,string
+executiveTitle1,役職1（executivePosition1の別名）,その他,string
+executiveTitle2,役職2,その他,string
+executiveTitle3,役職3,その他,string
+executiveTitle4,役職4,その他,string
+executiveTitle5,役職5,その他,string
+executiveTitle6,役職6,その他,string
+executiveTitle7,役職7,その他,string
+executiveTitle8,役職8,その他,string
+executiveTitle9,役職9,その他,string
+executiveTitle10,役職10,その他,string
