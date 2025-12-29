@@ -31,6 +31,5 @@ node_modules/
 out/
 *.log
 
-# track csv directory
-!csv/
-!csv/**
+# re-ignore huge csv dataset
+csv/
