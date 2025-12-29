@@ -1,0 +1,20 @@
+cat >> .gitignore << 'EOF'
+
+# ---- MUST ignore secrets ----
+**/*firebase-adminsdk*.json
+**/*serviceAccount*.json
+
+# ---- Python / venv ----
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# ---- Data / outputs (too many) ----
+*.json
+*.csv
+*.txt
+
+# ---- images (optional) ----
+*.png
+EOF
