@@ -1,8 +1,7 @@
 cat >> .gitignore << 'EOF'
 
-# allow required CSVs (override ignore)
+# ignore all CSVs by default, but keep these
+*.csv
 !companies_webinfo.csv
 !companies_new_fields_list.csv
-
 EOF
-
