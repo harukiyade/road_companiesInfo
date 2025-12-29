@@ -1,0 +1,2 @@
+#!/bin/bash
+cd "/Users/harukishiroyama/Library/Mobile Documents/com~apple~CloudDocs/info_companyDetail" && export FIREBASE_SERVICE_ACCOUNT_KEY="/Users/harukishiroyama/programming/ma-tool-albert/ma_tool/config/serviceAccountKey.json" && export START_FILE=1 && export END_FILE=10000 && export REVERSE=true && nohup npx tsx scripts/fill_null_fields_from_csv_enhanced.ts > fill_null_fields_reverse.log 2>&1 &
