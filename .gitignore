@@ -18,3 +18,5 @@ __pycache__/
 # ---- images (optional) ----
 *.png
 EOF
+# allow specific files
+!FIELD_MAPPING_TABLE.csv
