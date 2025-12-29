@@ -60,3 +60,6 @@ git push
 # secrets / local env
 .env
 .env.*
+
+# keep example file tracked
+!.env.example
