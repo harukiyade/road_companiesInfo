@@ -20,3 +20,13 @@ __pycache__/
 EOF
 # allow specific files
 !FIELD_MAPPING_TABLE.csv
+
+# local-only / big files
+.DS_Store
+.env
+.env.example
+csv/
+logs/
+node_modules/
+out/
+*.log
