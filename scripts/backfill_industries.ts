@@ -573,9 +573,9 @@ async function processDocument(
     };
 
     // 更新が必要な場合
-    const needsUpdate =
+    const needsUpdate: boolean =
       !dryRun &&
-      match &&
+      !!match &&
       match.method !== "manual-needed" &&
       match.confidence !== "low" &&
       finalAfter.large !== "未確定" &&
@@ -603,7 +603,7 @@ async function backfillIndustries() {
     const dryRun = process.env.DRY_RUN === "1";
     const limit = process.env.LIMIT ? parseInt(process.env.LIMIT, 10) : undefined;
     const startAfterId = process.env.START_AFTER_ID;
-    const parallelWorkers = process.env.PARALLEL_WORKERS ? parseInt(process.env.PARALLEL_WORKERS, 10) : 8;
+    const parallelWorkers = process.env.PARALLEL_WORKERS ? parseInt(process.env.PARALLEL_WORKERS, 10) : 16;
 
     console.log("業種バックフィル処理を開始...");
     if (dryRun) {
@@ -673,11 +673,41 @@ async function backfillIndustries() {
     let lastDoc: admin.firestore.QueryDocumentSnapshot | null = null;
 
     // companies_new を取得（orderByで効率的なページネーション）
+    // タイムアウト対策のため、バッチサイズを1000に設定
     const BATCH_SIZE = 1000;
-    const MAX_BATCH_COMMIT_SIZE = 500;
+    const MAX_BATCH_COMMIT_SIZE = 500; // Firestoreのバッチ制限は500
+    const MAX_RETRIES = 3; // クエリリトライ回数
+    const RETRY_DELAY = 5000; // リトライ待機時間（ミリ秒）
+    
     const companiesCollection = db
       .collection("companies_new")
       .orderBy(admin.firestore.FieldPath.documentId());
+
+    /**
+     * リトライ付きクエリ実行
+     */
+    async function executeQueryWithRetry(
+      query: admin.firestore.Query,
+      retryCount: number = 0
+    ): Promise<admin.firestore.QuerySnapshot> {
+      try {
+        return await query.get();
+      } catch (error: any) {
+        // タイムアウトエラーまたは一時的なエラーの場合、リトライ
+        if (
+          (error.code === 14 || error.code === 4 || error.code === 13) &&
+          retryCount < MAX_RETRIES
+        ) {
+          const delay = RETRY_DELAY * (retryCount + 1);
+          console.warn(
+            `⚠️  クエリエラー (code: ${error.code}), ${delay}ms後にリトライします (${retryCount + 1}/${MAX_RETRIES})...`
+          );
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          return executeQueryWithRetry(query, retryCount + 1);
+        }
+        throw error;
+      }
+    }
 
     while (true) {
       let query = companiesCollection.limit(BATCH_SIZE);
@@ -691,7 +721,39 @@ async function backfillIndustries() {
         query = query.startAfter(lastDoc);
       }
 
-      const snapshot = await query.get();
+      // リトライ付きクエリ実行
+      let snapshot: admin.firestore.QuerySnapshot;
+      try {
+        snapshot = await executeQueryWithRetry(query);
+      } catch (error: any) {
+        // 最終的なエラー処理
+        console.error(`❌ クエリエラー（リトライ後も失敗）:`, error.message);
+        console.error(`   最後に処理したdocId: ${lastDoc?.id || "なし"}`);
+        console.error(`   このdocIdをSTART_AFTER_IDに指定して再開できます`);
+        
+        // エラーログに記録
+        const fatalErrorLogPath = path.join(
+          outDir,
+          `industry_backfill_fatal_error_${timestamp}.log`
+        );
+        fs.writeFileSync(
+          fatalErrorLogPath,
+          `# 重大エラー発生\n` +
+          `# 時刻: ${new Date().toISOString()}\n` +
+          `# エラー: ${error.message}\n` +
+          `# コード: ${error.code}\n` +
+          `# 最後に処理したdocId: ${lastDoc?.id || "なし"}\n` +
+          `# 処理済み: ${totalProcessed} 件\n` +
+          `# 更新: ${totalUpdated} 件\n` +
+          `#\n` +
+          `# 再開コマンド:\n` +
+          `# export START_AFTER_ID='${lastDoc?.id || ""}'\n` +
+          `# npx ts-node scripts/backfill_industries.ts\n`
+        );
+        console.error(`📁 エラーログ: ${fatalErrorLogPath}`);
+        throw error;
+      }
+      
       if (snapshot.empty || (limit && totalProcessed >= limit)) {
         break;
       }
@@ -699,23 +761,27 @@ async function backfillIndustries() {
       console.log(`\nバッチ取得: ${snapshot.size} 件`);
 
       // 並列処理用にチャンクに分割
-      const docs = snapshot.docs;
+      const docs: admin.firestore.QueryDocumentSnapshot[] = snapshot.docs;
       const chunks = chunkArray(docs, parallelWorkers);
 
       let batch = db.batch();
       let batchCount = 0;
 
-      for (const chunk of chunks) {
-        // チャンク内のドキュメントを並列処理
-        const promises = chunk.map((doc) =>
-          processDocument(doc, industryMaster, dryRun)
-        );
+      // すべてのチャンクを並列で処理（処理速度向上）
+      const chunkPromises = chunks.map((chunk) =>
+        Promise.all(chunk.map((doc) => processDocument(doc, industryMaster, dryRun)))
+      );
 
-        const results = await Promise.all(promises);
+      const chunkResults = await Promise.all(chunkPromises);
+
+      // チャンクごとの結果を順次処理
+      for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
+        const chunk = chunks[chunkIndex];
+        const results = chunkResults[chunkIndex];
 
         for (let i = 0; i < results.length; i++) {
           const { result, needsUpdate, finalAfter, error } = results[i];
-          const doc = chunk[i];
+          const doc: admin.firestore.QueryDocumentSnapshot = chunk[i];
 
           totalProcessed++;
 
@@ -769,9 +835,10 @@ async function backfillIndustries() {
               batchCount++;
               totalUpdated++;
 
-              // 更新ログに記録
+              // 更新ログに記録（バッファリングでパフォーマンス向上）
               updatedLogStream.write(`${doc.id},"${result.corporateNumber || ""}","${result.name || ""}","${finalAfter.large}","${finalAfter.middle}","${finalAfter.small}","${finalAfter.detail}"\n`);
-              logStream.write(`UPDATED: ${doc.id} - ${result.name || ""} - ${finalAfter.large}/${finalAfter.middle}/${finalAfter.small}\n`);
+              // 詳細ログは必要最小限に（パフォーマンス向上のため）
+              // logStream.write(`UPDATED: ${doc.id} - ${result.name || ""} - ${finalAfter.large}/${finalAfter.middle}/${finalAfter.small}\n`);
 
               if (batchCount >= MAX_BATCH_COMMIT_SIZE) {
                 await batch.commit();
