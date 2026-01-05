@@ -89,6 +89,7 @@ interface CompanyData {
   industry?: string | null;
   industries?: string[] | string | null;
   industryName?: string | null;
+  industryCategories?: string | null;
   [key: string]: any;
 }
 
@@ -243,6 +244,176 @@ function normalizeText(text: string | null | undefined): string {
     .replace(/[０-９]/g, (s) => String.fromCharCode(s.charCodeAt(0) - 0xfee0)) // 全角数字→半角
     .replace(/[Ａ-Ｚａ-ｚ]/g, (s) => String.fromCharCode(s.charCodeAt(0) - 0xfee0)) // 全角英字→半角
     .normalize("NFKC"); // NFKC正規化
+}
+
+// ------------------------------
+// industryDetailの表記を統一（コレクション内で検索可能にするため）
+// ------------------------------
+
+/**
+ * 既存の業種フィールドをマスタの表記に統一する
+ * industries.csvの表記に合わせるため
+ */
+function normalizeIndustryFieldToMaster(
+  existingValue: string | null | undefined,
+  masterValues: Map<string, IndustryTree[]>
+): string {
+  if (!existingValue || typeof existingValue !== "string" || existingValue.trim() === "") {
+    return "";
+  }
+
+  const normalizedExisting = normalizeText(existingValue);
+  if (!normalizedExisting) {
+    return "";
+  }
+
+  // マスタの値から、正規化後に一致するものを探す
+  for (const masterValue of masterValues.keys()) {
+    if (normalizeText(masterValue) === normalizedExisting) {
+      return masterValue; // マスタの表記に統一
+    }
+  }
+
+  // 「業」の有無を考慮した部分一致
+  const normalizedWithoutIndustry = normalizedExisting.replace(/業$/, "");
+  if (normalizedWithoutIndustry.length > 0) {
+    for (const masterValue of masterValues.keys()) {
+      const normalizedMaster = normalizeText(masterValue);
+      const normalizedMasterWithoutIndustry = normalizedMaster.replace(/業$/, "");
+      
+      if (normalizedWithoutIndustry === normalizedMasterWithoutIndustry) {
+        // マスタの値を優先
+        return masterValue;
+      }
+    }
+  }
+
+  // マッチしない場合は既存値をそのまま使用
+  return existingValue;
+}
+
+/**
+ * 不足しているフィールドを、他のフィールドから推測して補完する
+ * industry, industries, industryCategoriesなどのフィールドから値を推測
+ */
+function fillMissingFieldsFromOtherSources(
+  companyData: CompanyData,
+  currentValues: { large: string; middle: string; small: string; detail: string },
+  industryMaster: {
+    treeByLarge: Map<string, IndustryTree[]>;
+    treeByMiddle: Map<string, IndustryTree[]>;
+    treeBySmall: Map<string, IndustryTree[]>;
+  }
+): { large: string; middle: string; small: string; detail: string } {
+  const result = { ...currentValues };
+  
+  // 補完用のテキストソースを収集
+  const textSources: string[] = [];
+  
+  if (companyData.industry && typeof companyData.industry === "string") {
+    textSources.push(companyData.industry);
+  }
+  
+  if (companyData.industries) {
+    if (Array.isArray(companyData.industries)) {
+      companyData.industries.forEach((ind: any) => {
+        if (typeof ind === "string" && ind.trim().length > 0) {
+          textSources.push(ind);
+        }
+      });
+    } else if (typeof companyData.industries === "string") {
+      textSources.push(companyData.industries);
+    }
+  }
+  
+  if (companyData.industryCategories && typeof companyData.industryCategories === "string") {
+    textSources.push(companyData.industryCategories);
+  }
+  
+  if (companyData.industryDetail && typeof companyData.industryDetail === "string") {
+    textSources.push(companyData.industryDetail);
+  }
+  
+  // 不足しているフィールドを補完
+  // 優先順位: small → middle → large → detail
+  // smallが空の場合、textSourcesから推測
+  if (!result.small && textSources.length > 0) {
+    for (const text of textSources) {
+      if (!text || typeof text !== "string") continue;
+      
+      // normalizeIndustryFieldToMasterを使用して、マスタの表記に統一
+      const normalizedSmall = normalizeIndustryFieldToMaster(text, industryMaster.treeBySmall);
+      if (normalizedSmall && normalizedSmall.trim() !== "") {
+        result.small = normalizedSmall; // マスタの表記を使用、または推測値
+        break;
+      }
+    }
+  }
+  
+  // middleが空の場合、textSourcesから推測
+  if (!result.middle && textSources.length > 0) {
+    for (const text of textSources) {
+      if (!text || typeof text !== "string") continue;
+      
+      const normalizedMiddle = normalizeIndustryFieldToMaster(text, industryMaster.treeByMiddle);
+      if (normalizedMiddle && normalizedMiddle.trim() !== "") {
+        result.middle = normalizedMiddle; // マスタの表記を使用、または推測値
+        break;
+      }
+    }
+  }
+  
+  // largeが空の場合、textSourcesから推測
+  if (!result.large && textSources.length > 0) {
+    for (const text of textSources) {
+      if (!text || typeof text !== "string") continue;
+      
+      const normalizedLarge = normalizeIndustryFieldToMaster(text, industryMaster.treeByLarge);
+      if (normalizedLarge && normalizedLarge.trim() !== "") {
+        result.large = normalizedLarge; // マスタの表記を使用、または推測値
+        break;
+      }
+    }
+  }
+  
+  // detailが空の場合、smallまたはtextSourcesから推測（埋められない場合は空のまま）
+  if (!result.detail) {
+    if (result.small) {
+      result.detail = result.small;
+    } else if (textSources.length > 0) {
+      const normalizedDetail = normalizeIndustryFieldToMaster(
+        textSources[0],
+        industryMaster.treeBySmall
+      );
+      // マスタに一致する場合のみ設定（一致しない場合は空のまま）
+      if (normalizedDetail && normalizedDetail.trim() !== "") {
+        result.detail = normalizedDetail;
+      }
+      // 埋められない場合は空のまま（無理に埋めない）
+    }
+  }
+  
+  return result;
+}
+
+/**
+ * industryDetailの値を処理する
+ * industryDetailはscripts/industries.csvにないので、既存値をそのまま採用する
+ */
+function unifyIndustryDetail(
+  existingDetail: string | null | undefined,
+  matchedSmall: string,
+  industryMaster: {
+    treeBySmall: Map<string, IndustryTree[]>;
+  }
+): string {
+  // 既存値がある場合は、そのまま採用（CSVにないので）
+  if (existingDetail && typeof existingDetail === "string" && existingDetail.trim() !== "") {
+    return existingDetail;
+  }
+
+  // 既存値がない場合は、マッチしたsmallを使用
+  return matchedSmall;
 }
 
 // ------------------------------
@@ -514,11 +685,28 @@ async function processDocument(
     };
 
     // 高速化: 既に完全にマッチしている場合は早期チェック
+    // ただし、フィールドが欠けている場合や表記統一が必要な場合は更新が必要
     let skipMatching = false;
     if (before.large && before.middle && before.small) {
       const normalizedKey = `${normalizeText(before.large)}|${normalizeText(before.middle)}|${normalizeText(before.small)}`;
       if (industryMaster.normalizedTreeKeyMap.has(normalizedKey)) {
-        skipMatching = true;
+        const matchedItem = industryMaster.normalizedTreeKeyMap.get(normalizedKey);
+        if (matchedItem) {
+          // detailも確認（表記統一が必要かチェック）
+          if (before.detail) {
+            const unifiedDetail = unifyIndustryDetail(before.detail, matchedItem.small, industryMaster);
+            // 全て一致していて、表記も統一されている場合のみスキップ
+            if (before.large === matchedItem.large && 
+                before.middle === matchedItem.middle && 
+                before.small === matchedItem.small &&
+                before.detail === unifiedDetail) {
+              skipMatching = true;
+            }
+          } else {
+            // detailが欠けている場合は更新が必要
+            skipMatching = false;
+          }
+        }
       }
     }
 
@@ -543,19 +731,55 @@ async function processDocument(
     };
 
     if (!match) {
-      finalAfter = {
-        large: before.large || "未確定",
-        middle: before.middle || "未確定",
-        small: before.small || "未確定",
-        detail: before.detail || before.small || "未確定",
+      // マッチしない場合: industries.csvにある値は採用、ない値は既存値を採用
+      // 各フィールドを個別にマスタと照合して、マスタにあるものはマスタの表記に統一
+      const normalizedLarge = normalizeIndustryFieldToMaster(
+        before.large,
+        industryMaster.treeByLarge
+      );
+      const normalizedMiddle = normalizeIndustryFieldToMaster(
+        before.middle,
+        industryMaster.treeByMiddle
+      );
+      const normalizedSmall = normalizeIndustryFieldToMaster(
+        before.small,
+        industryMaster.treeBySmall
+      );
+      const normalizedDetail = normalizeIndustryFieldToMaster(
+        before.detail || before.small,
+        industryMaster.treeBySmall
+      );
+      
+      // industries.csvにある値は採用、ない値は既存値を採用
+      // normalizeIndustryFieldToMasterは、マスタにない場合は既存値を返す
+      let partialResult = {
+        large: normalizedLarge || before.large || "",
+        middle: normalizedMiddle || before.middle || "",
+        small: normalizedSmall || before.small || "",
+        detail: normalizedDetail || before.detail || before.small || "",
       };
+      
+      // 不足しているフィールドを、他のフィールドから補完
+      finalAfter = fillMissingFieldsFromOtherSources(companyData, partialResult, industryMaster);
     } else {
-      finalAfter = {
-        large: match.large,
-        middle: match.middle,
-        small: match.small,
-        detail: match.detail || match.small,
+      // マッチした場合: industries.csvにある値は採用、ない値は既存値を採用
+      // large, middle, smallはマスタの値を使用（industries.csvにある）
+      // detailは既存値を保持しつつ、マスタの表記に統一
+      const unifiedDetail = unifyIndustryDetail(
+        before.detail,
+        match.small,
+        industryMaster
+      );
+      
+      let matchedResult = {
+        large: match.large,      // industries.csvの値を使用
+        middle: match.middle,    // industries.csvの値を使用
+        small: match.small,      // industries.csvの値を使用
+        detail: unifiedDetail,  // 既存値を保持しつつ表記を統一（マスタにある場合はマスタの表記）
       };
+      
+      // 不足しているフィールドを、他のフィールドから補完（念のため）
+      finalAfter = fillMissingFieldsFromOtherSources(companyData, matchedResult, industryMaster);
     }
 
     const result: BackfillResult = {
@@ -573,19 +797,22 @@ async function processDocument(
     };
 
     // 更新が必要な場合
+    // ゴール: industries.csvの表記に統一、埋められるフィールドは埋める
+    // 更新条件：
+    // CSVを正として、既存の業種フィールドをCSVの値に更新する
+    // 値に変更がある場合は更新（全てのフィールドが埋まっている必要はない）
+    
+    // 値に変更があるかチェック
+    const hasValueChanges = 
+      before.large !== finalAfter.large ||
+      before.middle !== finalAfter.middle ||
+      before.small !== finalAfter.small ||
+      before.detail !== finalAfter.detail;
+    
+    // 更新条件: CSVを正として、値が変更された場合は更新
     const needsUpdate: boolean =
       !dryRun &&
-      !!match &&
-      match.method !== "manual-needed" &&
-      match.confidence !== "low" &&
-      finalAfter.large !== "未確定" &&
-      finalAfter.middle !== "未確定" &&
-      finalAfter.small !== "未確定" &&
-      (before.large !== finalAfter.large ||
-        before.middle !== finalAfter.middle ||
-        before.small !== finalAfter.small ||
-        before.detail !== finalAfter.detail) &&
-      !skipMatching;
+      hasValueChanges;
 
     return { result, needsUpdate, finalAfter, error: null };
   } catch (error: any) {
@@ -662,9 +889,63 @@ async function backfillIndustries() {
     errorLogStream.write(`# フォーマット: docId,corporateNumber,name,error\n`);
     errorLogStream.write(`#\n`);
 
-    // レポート用データ
-    const reportRows: BackfillResult[] = [];
-    const unresolvedRows: BackfillResult[] = [];
+    // レポート用CSVファイル（ストリーミング書き込みでメモリ使用量削減）
+    const reportPath = path.join(outDir, `industry_backfill_report_${timestamp}.csv`);
+    const unresolvedPath = path.join(outDir, `industry_unresolved_${timestamp}.csv`);
+    const reportStream = fs.createWriteStream(reportPath, { encoding: "utf8", flags: "w" });
+    const unresolvedStream = fs.createWriteStream(unresolvedPath, { encoding: "utf8", flags: "w" });
+    
+    // CSVヘッダーを書き込み
+    const csvHeaders = [
+      "docId",
+      "corporateNumber",
+      "name",
+      "beforeLarge",
+      "beforeMiddle",
+      "beforeSmall",
+      "beforeDetail",
+      "afterLarge",
+      "afterMiddle",
+      "afterSmall",
+      "afterDetail",
+      "method",
+      "confidence",
+      "unresolved",
+      "candidates",
+    ];
+    reportStream.write(csvHeaders.join(",") + "\n");
+    unresolvedStream.write(csvHeaders.join(",") + "\n");
+    
+    // CSV行をエスケープして書き込む関数
+    function writeCSVRow(stream: NodeJS.WritableStream, result: BackfillResult) {
+      const row = [
+        result.docId,
+        result.corporateNumber,
+        result.name,
+        result.before.large,
+        result.before.middle,
+        result.before.small,
+        result.before.detail,
+        result.after.large,
+        result.after.middle,
+        result.after.small,
+        result.after.detail,
+        result.method,
+        result.confidence,
+        result.unresolved || "",
+        result.candidates || "",
+      ];
+      
+      const escaped = row.map((cell) => {
+        const str = String(cell || "");
+        if (str.includes(",") || str.includes('"') || str.includes("\n")) {
+          return `"${str.replace(/"/g, '""')}"`;
+        }
+        return str;
+      });
+      
+      stream.write(escaped.join(",") + "\n");
+    }
 
     let totalProcessed = 0;
     let totalUpdated = 0;
@@ -675,7 +956,7 @@ async function backfillIndustries() {
     // companies_new を取得（orderByで効率的なページネーション）
     // タイムアウト対策のため、バッチサイズを1000に設定
     const BATCH_SIZE = 1000;
-    const MAX_BATCH_COMMIT_SIZE = 500; // Firestoreのバッチ制限は500
+    const MAX_BATCH_COMMIT_SIZE = 300; // Firestoreのバッチ制限は500だが、トランザクションサイズ制限もあるため300に設定
     const MAX_RETRIES = 3; // クエリリトライ回数
     const RETRY_DELAY = 5000; // リトライ待機時間（ミリ秒）
     
@@ -807,9 +1088,10 @@ async function backfillIndustries() {
             continue;
           }
 
-          reportRows.push(result);
+          // 結果をCSVにストリーミング書き込み（メモリ使用量削減）
+          writeCSVRow(reportStream, result);
 
-          // 未確定または要確認の場合は unresolved に追加
+          // 未確定または要確認の場合は unresolved にも書き込み
           const isUnresolved =
             !result.method ||
             result.method === "manual-needed" ||
@@ -819,13 +1101,23 @@ async function backfillIndustries() {
             finalAfter.small === "未確定";
 
           if (isUnresolved) {
-            unresolvedRows.push(result);
+            writeCSVRow(unresolvedStream, result);
             totalUnresolved++;
           }
 
           // 更新が必要な場合
           if (needsUpdate && finalAfter) {
             try {
+              // バッチサイズチェック：上限に達する前にコミット
+              if (batchCount >= MAX_BATCH_COMMIT_SIZE) {
+                await batch.commit();
+                console.log(`  バッチコミット完了: ${batchCount} 件`);
+                logStream.write(`# バッチコミット: ${batchCount} 件 at ${new Date().toISOString()}\n`);
+                updatedLogStream.write(`# バッチコミット: ${batchCount} 件 at ${new Date().toISOString()}\n`);
+                batch = db.batch(); // 新しいバッチを作成
+                batchCount = 0;
+              }
+
               batch.update(doc.ref, {
                 industryLarge: finalAfter.large,
                 industryMiddle: finalAfter.middle,
@@ -839,21 +1131,22 @@ async function backfillIndustries() {
               updatedLogStream.write(`${doc.id},"${result.corporateNumber || ""}","${result.name || ""}","${finalAfter.large}","${finalAfter.middle}","${finalAfter.small}","${finalAfter.detail}"\n`);
               // 詳細ログは必要最小限に（パフォーマンス向上のため）
               // logStream.write(`UPDATED: ${doc.id} - ${result.name || ""} - ${finalAfter.large}/${finalAfter.middle}/${finalAfter.small}\n`);
-
-              if (batchCount >= MAX_BATCH_COMMIT_SIZE) {
-                await batch.commit();
-                console.log(`  バッチコミット完了: ${batchCount} 件`);
-                logStream.write(`# バッチコミット: ${batchCount} 件 at ${new Date().toISOString()}\n`);
-                updatedLogStream.write(`# バッチコミット: ${batchCount} 件 at ${new Date().toISOString()}\n`);
-                batch = db.batch();
-                batchCount = 0;
-              }
             } catch (error: any) {
               totalErrors++;
               const errorMsg = `更新エラー: ${error.message}`;
               console.error(`  [エラー] ${doc.id}: ${errorMsg}`);
               errorLogStream.write(`${doc.id},"${result.corporateNumber || ""}","${result.name || ""}","${errorMsg}"\n`);
               logStream.write(`ERROR: ${doc.id} - ${errorMsg}\n`);
+              
+              // バッチエラーの場合、新しいバッチを作成
+              if (error.message.includes("WriteBatch") || error.message.includes("Transaction too big")) {
+                try {
+                  batch = db.batch(); // 新しいバッチを作成
+                  batchCount = 0;
+                } catch (resetError) {
+                  // リセットエラーは無視
+                }
+              }
             }
           }
         }
@@ -895,66 +1188,10 @@ async function backfillIndustries() {
     updatedLogStream.end();
     errorLogStream.write(`# 処理完了: ${new Date().toISOString()}\n`);
     errorLogStream.end();
-
-    // レポート出力
-    const reportPath = path.join(outDir, "industry_backfill_report.csv");
-    const unresolvedPath = path.join(outDir, "industry_unresolved.csv");
-
-    // CSV出力関数
-    function writeCSV(filePath: string, rows: BackfillResult[]) {
-      const headers = [
-        "docId",
-        "corporateNumber",
-        "name",
-        "beforeLarge",
-        "beforeMiddle",
-        "beforeSmall",
-        "beforeDetail",
-        "afterLarge",
-        "afterMiddle",
-        "afterSmall",
-        "afterDetail",
-        "method",
-        "confidence",
-        "unresolved",
-        "candidates",
-      ];
-
-      const csvRows = rows.map((row) => [
-        row.docId,
-        row.corporateNumber,
-        row.name,
-        row.before.large,
-        row.before.middle,
-        row.before.small,
-        row.before.detail,
-        row.after.large,
-        row.after.middle,
-        row.after.small,
-        row.after.detail,
-        row.method,
-        row.confidence,
-        row.unresolved || "",
-        row.candidates || "",
-      ]);
-
-      const lines = [headers.join(",")];
-      for (const row of csvRows) {
-        const escaped = row.map((cell) => {
-          const str = String(cell || "");
-          if (str.includes(",") || str.includes('"') || str.includes("\n")) {
-            return `"${str.replace(/"/g, '""')}"`;
-          }
-          return str;
-        });
-        lines.push(escaped.join(","));
-      }
-
-      fs.writeFileSync(filePath, lines.join("\n"), "utf8");
-    }
-
-    writeCSV(reportPath, reportRows);
-    writeCSV(unresolvedPath, unresolvedRows);
+    
+    // CSVストリームを閉じる
+    reportStream.end();
+    unresolvedStream.end();
 
     console.log(`\n✅ 処理完了`);
     console.log(`総処理数: ${totalProcessed} 件`);
