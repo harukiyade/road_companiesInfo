@@ -311,7 +311,12 @@ async function exportIndustryValuesUnified() {
       writeUnifiedRow(csvStream, "industryDetail", item);
     }
 
-    csvStream.end();
+    // CSVストリームを確実に閉じる
+    await new Promise<void>((resolve, reject) => {
+      csvStream.on("finish", resolve);
+      csvStream.on("error", reject);
+      csvStream.end();
+    });
 
     // 各フィールドごとのファイルも作成（検索しやすくするため）
     const largeCsvPath = path.join(outDir, `industryLarge_values_unified_${timestamp}.csv`);
@@ -319,22 +324,26 @@ async function exportIndustryValuesUnified() {
     const smallCsvPath = path.join(outDir, `industrySmall_values_unified_${timestamp}.csv`);
     const detailCsvPath = path.join(outDir, `industryDetail_values_unified_${timestamp}.csv`);
 
-    const writeFieldCsv = (filePath: string, items: IndustryValueCount[], fieldName: string) => {
-      const stream = fs.createWriteStream(filePath, { encoding: "utf8", flags: "w" });
-      stream.write(`${fieldName},正規化値,出現回数,統一前の値一覧\n`);
-      for (const item of items) {
-        const originalValuesList = Array.from(item.originalValues).join(" | ");
-        stream.write(
-          `"${item.value.replace(/"/g, '""')}","${item.normalizedValue.replace(/"/g, '""')}",${item.count},"${originalValuesList.replace(/"/g, '""')}"\n`
-        );
-      }
-      stream.end();
+    const writeFieldCsv = async (filePath: string, items: IndustryValueCount[], fieldName: string): Promise<void> => {
+      return new Promise<void>((resolve, reject) => {
+        const stream = fs.createWriteStream(filePath, { encoding: "utf8", flags: "w" });
+        stream.write(`${fieldName},正規化値,出現回数,統一前の値一覧\n`);
+        for (const item of items) {
+          const originalValuesList = Array.from(item.originalValues).join(" | ");
+          stream.write(
+            `"${item.value.replace(/"/g, '""')}","${item.normalizedValue.replace(/"/g, '""')}",${item.count},"${originalValuesList.replace(/"/g, '""')}"\n`
+          );
+        }
+        stream.on("finish", resolve);
+        stream.on("error", reject);
+        stream.end();
+      });
     };
 
-    writeFieldCsv(largeCsvPath, largeSorted, "industryLarge");
-    writeFieldCsv(middleCsvPath, middleSorted, "industryMiddle");
-    writeFieldCsv(smallCsvPath, smallSorted, "industrySmall");
-    writeFieldCsv(detailCsvPath, detailSorted, "industryDetail");
+    await writeFieldCsv(largeCsvPath, largeSorted, "industryLarge");
+    await writeFieldCsv(middleCsvPath, middleSorted, "industryMiddle");
+    await writeFieldCsv(smallCsvPath, smallSorted, "industrySmall");
+    await writeFieldCsv(detailCsvPath, detailSorted, "industryDetail");
 
     logStream.write(`# 処理完了: ${new Date().toISOString()}\n`);
     logStream.end();
