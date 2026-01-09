@@ -1,0 +1,511 @@
+/* 
+  タイプJ（133.csv）を削除して、133.csvのデータで再作成
+*/
+
+import * as fs from "fs";
+import * as path from "path";
+import admin from "firebase-admin";
+import type { Firestore } from "firebase-admin/firestore";
+import { parse } from "csv-parse/sync";
+
+const COLLECTION_NAME = "companies_new";
+const TYPE_J_DOC_ID = "FVCBXMICk0bzVEkZzxZv";
+const CSV_PATH = "csv/133.csv";
+
+// Firebase初期化
+if (!admin.apps.length) {
+  const serviceAccountPath = process.env.GOOGLE_APPLICATION_CREDENTIALS || 
+    path.join(__dirname, "../albert-ma-firebase-adminsdk-iat1k-a64039899f.json");
+  
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccountPath)
+  });
+}
+
+const db: Firestore = admin.firestore();
+
+/**
+ * 既存のフィールド構造に準拠した空のテンプレート（companies_newコレクションの完全なフィールド構造）
+ */
+function getEmptyTemplate(): Record<string, any> {
+  return {
+    acquisition: null,
+    adExpiration: null,
+    address: null,
+    affiliations: null,
+    averageAge: null,
+    averageOvertimeHours: null,
+    averagePaidLeave: null,
+    averageYearsOfService: null,
+    badges: [],
+    bankCorporateNumber: null,
+    banks: [],
+    businessDescriptions: null,
+    businessItems: [],
+    businessSummary: null,
+    capitalStock: null,
+    changeCount: null,
+    clients: null,
+    companyDescription: null,
+    companyUrl: null,
+    contactFormUrl: null,
+    contactPhoneNumber: null,
+    corporateNumber: null,
+    corporationType: null,
+    createdAt: null,
+    dateOfEstablishment: null,
+    demandProducts: null,
+    departmentName1: null,
+    departmentAddress1: null,
+    departmentPhone1: null,
+    departmentName2: null,
+    departmentAddress2: null,
+    departmentPhone2: null,
+    departmentName3: null,
+    departmentAddress3: null,
+    departmentPhone3: null,
+    departmentName4: null,
+    departmentAddress4: null,
+    departmentPhone4: null,
+    departmentName5: null,
+    departmentAddress5: null,
+    departmentPhone5: null,
+    departmentName6: null,
+    departmentAddress6: null,
+    departmentPhone6: null,
+    departmentName7: null,
+    departmentAddress7: null,
+    departmentPhone7: null,
+    departmentLocation: null,
+    email: null,
+    employeeCount: null,
+    employeeNumber: null,
+    established: null,
+    executives: null,
+    executiveName1: null,
+    executivePosition1: null,
+    executiveName2: null,
+    executivePosition2: null,
+    executiveName3: null,
+    executivePosition3: null,
+    executiveName4: null,
+    executivePosition4: null,
+    executiveName5: null,
+    executivePosition5: null,
+    executiveName6: null,
+    executivePosition6: null,
+    executiveName7: null,
+    executivePosition7: null,
+    executiveName8: null,
+    executivePosition8: null,
+    executiveName9: null,
+    executivePosition9: null,
+    executiveName10: null,
+    executivePosition10: null,
+    externalDetailUrl: null,
+    facebook: null,
+    factoryCount: null,
+    fax: null,
+    femaleExecutiveRatio: null,
+    financials: null,
+    fiscalMonth: null,
+    fiscalMonth1: null,
+    fiscalMonth2: null,
+    fiscalMonth3: null,
+    fiscalMonth4: null,
+    fiscalMonth5: null,
+    founding: null,
+    foundingYear: null,
+    headquartersAddress: null,
+    industries: [],
+    industry: null,
+    industryCategories: null,
+    industryDetail: null,
+    industryLarge: null,
+    industryMiddle: null,
+    industrySmall: null,
+    issuedShares: null,
+    kana: null,
+    latestFiscalYearMonth: null,
+    latestProfit: null,
+    latestRevenue: null,
+    linkedin: null,
+    listing: null,
+    location: null,
+    marketSegment: null,
+    metaDescription: null,
+    metaKeywords: null,
+    name: null,
+    nameEn: null,
+    nikkeiCode: null,
+    numberOfActivity: null,
+    officeCount: null,
+    operatingIncome: null,
+    overview: null,
+    phoneNumber: null,
+    postalCode: null,
+    prefecture: null,
+    profileUrl: null,
+    profit1: null,
+    profit2: null,
+    profit3: null,
+    profit4: null,
+    profit5: null,
+    qualificationGrade: null,
+    registrant: null,
+    representativeAlmaMater: null,
+    representativeBirthDate: null,
+    representativeHomeAddress: null,
+    representativeKana: null,
+    representativeName: null,
+    representativePhone: null,
+    representativePostalCode: null,
+    representativeRegisteredAddress: null,
+    representativeTitle: null,
+    revenue: null,
+    revenueFromStatements: null,
+    revenue1: null,
+    revenue2: null,
+    revenue3: null,
+    revenue4: null,
+    revenue5: null,
+    salesNotes: null,
+    shareholders: null,
+    specialNote: null,
+    specialties: null,
+    storeCount: null,
+    subsidiaries: [],
+    suppliers: [],
+    tags: [],
+    totalAssets: null,
+    totalLiabilities: null,
+    tradingStatus: null,
+    transportation: null,
+    updateCount: null,
+    updateDate: null,
+    updatedAt: null,
+    urls: [],
+    wantedly: null,
+    youtrust: null,
+  };
+}
+
+/**
+ * タイプJ（133.csv）のデータをマッピング
+ */
+function mapTypeJ(row: Record<string, any>): Record<string, any> {
+  const data = getEmptyTemplate();
+  
+  // 基本情報
+  data.name = row["会社名"] || null;
+  data.prefecture = row["都道府県"] || null;
+  data.representativeName = row["代表者名"] || null;
+  data.corporateNumber = row["法人番号"] || null;
+  data.companyUrl = row["URL"] || null;
+  data.postalCode = row["郵便番号"] || null;
+  data.address = row["住所"] || null;
+  data.headquartersAddress = row["住所"] || null;
+  data.established = row["設立"] || null;
+  data.phoneNumber = row["電話番号(窓口)"] || null;
+  
+  // 業種1〜3
+  data.industry = row["業種1"] || null;
+  // industryLarge・industryMiddle・industrySmallに業種1〜3を順に対応
+  data.industryLarge = row["業種1"] || null;
+  data.industryMiddle = row["業種2"] || null;
+  data.industrySmall = row["業種3"] || null;
+  if (row["業種1"] || row["業種2"] || row["業種3"]) {
+    data.industries = [
+      row["業種1"] || null,
+      row["業種2"] || null,
+      row["業種3"] || null,
+    ].filter(v => v !== null && v !== "");
+  }
+  
+  // 代表者情報
+  data.representativePostalCode = row["代表者郵便番号"] || null;
+  data.representativeRegisteredAddress = row["代表者郵便番号"] || null;
+  data.representativeHomeAddress = row["代表者住所"] || null;
+  data.representativeBirthDate = row["代表者誕生日"] || null;
+  
+  // 財務情報
+  // 資本金（0も有効な値として扱う）
+  if (row["資本金"] !== undefined && row["資本金"] !== null && String(row["資本金"]).trim() !== "") {
+    const capitalStr = String(row["資本金"]).replace(/,/g, "").trim();
+    const capitalValue = parseFloat(capitalStr);
+    if (!isNaN(capitalValue)) {
+      data.capitalStock = capitalValue;
+    }
+  }
+  
+  // 上場区分
+  data.listing = row["上場"] || null;
+  
+  // 直近決算情報
+  if (row["直近決算年月"]) {
+    data.fiscalMonth = row["直近決算年月"] || null;
+  }
+  // 直近売上
+  if (row["直近売上"] !== undefined && row["直近売上"] !== null && String(row["直近売上"]).trim() !== "") {
+    const revenueStr = String(row["直近売上"]).replace(/,/g, "").trim();
+    const revenueValue = parseFloat(revenueStr);
+    if (!isNaN(revenueValue)) {
+      data.revenue = revenueValue;
+    }
+  }
+  // 直近利益
+  if (row["直近利益"] !== undefined && row["直近利益"] !== null && String(row["直近利益"]).trim() !== "") {
+    const profitStr = String(row["直近利益"]).replace(/,/g, "").trim();
+    const profitValue = parseFloat(profitStr);
+    if (!isNaN(profitValue)) {
+      data.financials = profitValue;
+    }
+  }
+  
+  // 説明・概要
+  data.companyDescription = row["説明"] || null;
+  data.overview = row["概要"] || null;
+  
+  // 仕入れ先（suppliers配列）
+  if (row["仕入れ先"]) {
+    const suppliersStr = String(row["仕入れ先"]);
+    const suppliersArr = suppliersStr.split(/[、,，]/).map(s => s.trim()).filter(s => s);
+    data.suppliers = suppliersArr;
+  }
+  
+  // 取引先（clients）
+  data.clients = row["取引先"] || null;
+  
+  // 取引先銀行（banks配列）
+  if (row["取引先銀行"]) {
+    const banksStr = String(row["取引先銀行"]);
+    // 全角・半角カンマ、全角・半角読点で分割
+    const banksArr = banksStr.split(/[、,，,]/).map(s => s.trim()).filter(s => s);
+    data.banks = banksArr;
+  }
+  
+  // 取締役
+  data.executives = row["取締役"] || null;
+  
+  // 株主（shareholders）
+  data.shareholders = row["株主"] || null;
+  
+  // 従業員数（0も有効な値として扱う）
+  if (row["社員数"] !== undefined && row["社員数"] !== null && String(row["社員数"]).trim() !== "") {
+    const employeeStr = String(row["社員数"]).replace(/,/g, "").trim();
+    const employeeValue = parseInt(employeeStr);
+    if (!isNaN(employeeValue)) {
+      data.employeeCount = employeeValue;
+    }
+  }
+  
+  // オフィス数、工場数、店舗数（0も有効な値として扱う）
+  if (row["オフィス数"] !== undefined && row["オフィス数"] !== null && String(row["オフィス数"]).trim() !== "") {
+    const officeStr = String(row["オフィス数"]).replace(/,/g, "").trim();
+    const officeValue = parseInt(officeStr);
+    if (!isNaN(officeValue)) {
+      data.officeCount = officeValue;
+    }
+  }
+  if (row["工場数"] !== undefined && row["工場数"] !== null && String(row["工場数"]).trim() !== "") {
+    const factoryStr = String(row["工場数"]).replace(/,/g, "").trim();
+    const factoryValue = parseInt(factoryStr);
+    if (!isNaN(factoryValue)) {
+      data.factoryCount = factoryValue;
+    }
+  }
+  if (row["店舗数"] !== undefined && row["店舗数"] !== null && String(row["店舗数"]).trim() !== "") {
+    const storeStr = String(row["店舗数"]).replace(/,/g, "").trim();
+    const storeValue = parseInt(storeStr);
+    if (!isNaN(storeValue)) {
+      data.storeCount = storeValue;
+    }
+  }
+  
+  return data;
+}
+
+async function main() {
+  console.log("================================================================================");
+  console.log("タイプJ: 削除と再追加（133.csv）");
+  console.log("================================================================================");
+  console.log();
+
+  // 1. 既存のドキュメントを削除
+  console.log("【STEP 1】既存のドキュメントを削除中...");
+  try {
+    const docRef = db.collection(COLLECTION_NAME).doc(TYPE_J_DOC_ID);
+    const docSnap = await docRef.get();
+
+    if (docSnap.exists) {
+      const oldData = docSnap.data();
+      console.log(`削除対象: ${oldData?.name || "(名前なし)"} (ID: ${TYPE_J_DOC_ID})`);
+      await docRef.delete();
+      console.log(`✓ 削除完了 (ID: ${TYPE_J_DOC_ID})`);
+    } else {
+      console.log(`⚠️  ドキュメントが見つかりません (ID: ${TYPE_J_DOC_ID})`);
+    }
+  } catch (error: any) {
+    console.error(`❌ 削除エラー: ${error.message}`);
+    throw error;
+  }
+
+  console.log();
+
+  // 2. CSVから最初のデータ行を取得（133.csvの1行目）
+  console.log(`【STEP 2】${CSV_PATH}から最初のデータ行を読み込み中...`);
+  const csvContent = fs.readFileSync(CSV_PATH, "utf-8");
+  const records = parse(csvContent, {
+    columns: true,
+    skip_empty_lines: true,
+    relax_column_count: true,
+    trim: true,
+  }) as Record<string, any>[];
+  
+  if (records.length === 0) {
+    throw new Error(`${CSV_PATH}: データが見つかりません`);
+  }
+  
+  // 最初のデータ行を取得
+  const row = records[0];
+  
+  console.log(`✓ データ取得完了`);
+  console.log(`  【CSVの内容（1行目）】`);
+  console.log(`  会社名: ${row["会社名"]}`);
+  console.log(`  都道府県: ${row["都道府県"]}`);
+  console.log(`  代表者名: ${row["代表者名"]}`);
+  console.log(`  法人番号: ${row["法人番号"] || "(なし)"}`);
+  console.log(`  住所: ${row["住所"]}`);
+  console.log(`  郵便番号: ${row["郵便番号"] || "(なし)"}`);
+  console.log(`  業種1: ${row["業種1"] || "(なし)"}`);
+  console.log(`  業種2: ${row["業種2"] || "(なし)"}`);
+  console.log(`  業種3: ${row["業種3"] || "(なし)"}`);
+  console.log(`  代表者郵便番号: ${row["代表者郵便番号"] || "(なし)"}`);
+  console.log(`  代表者住所: ${row["代表者住所"] || "(なし)"}`);
+  console.log(`  代表者誕生日: ${row["代表者誕生日"] || "(なし)"}`);
+  console.log(`  資本金: ${row["資本金"] || "(なし)"}`);
+  console.log(`  上場: ${row["上場"] || "(なし)"}`);
+  console.log(`  直近決算年月: ${row["直近決算年月"] || "(なし)"}`);
+  console.log(`  直近売上: ${row["直近売上"] || "(なし)"}`);
+  console.log(`  直近利益: ${row["直近利益"] || "(なし)"}`);
+  console.log(`  説明: ${row["説明"] ? row["説明"].substring(0, 50) + "..." : "(なし)"}`);
+  console.log(`  概要: ${row["概要"] ? row["概要"].substring(0, 50) + "..." : "(なし)"}`);
+  console.log(`  仕入れ先: ${row["仕入れ先"] || "(なし)"}`);
+  console.log(`  取引先: ${row["取引先"] || "(なし)"}`);
+  console.log(`  取引先銀行: ${row["取引先銀行"] || "(なし)"}`);
+  console.log(`  取締役: ${row["取締役"] || "(なし)"}`);
+  console.log(`  株主: ${row["株主"] || "(なし)"}`);
+  console.log(`  社員数: ${row["社員数"] || "(なし)"}`);
+  console.log(`  オフィス数: ${row["オフィス数"] || "(なし)"}`);
+  console.log(`  工場数: ${row["工場数"] || "(なし)"}`);
+  console.log(`  店舗数: ${row["店舗数"] || "(なし)"}`);
+
+  console.log();
+
+  // 3. データをマッピング
+  console.log("【STEP 3】データをマッピング中...");
+  const companyData = mapTypeJ(row);
+  
+  console.log(`✓ マッピング完了`);
+  console.log(`  企業名: ${companyData.name}`);
+  console.log(`  都道府県: ${companyData.prefecture}`);
+  console.log(`  代表者名: ${companyData.representativeName}`);
+  console.log(`  法人番号: ${companyData.corporateNumber || "(なし)"}`);
+  console.log(`  住所: ${companyData.address}`);
+  console.log(`  郵便番号: ${companyData.postalCode || "(なし)"}`);
+  console.log(`  業種1: ${companyData.industry || "(なし)"}`);
+  console.log(`  industryLarge: ${companyData.industryLarge || "(なし)"}`);
+  console.log(`  industryMiddle: ${companyData.industryMiddle || "(なし)"}`);
+  console.log(`  industrySmall: ${companyData.industrySmall || "(なし)"}`);
+  console.log(`  業種配列: ${JSON.stringify(companyData.industries)}`);
+  console.log(`  代表者郵便番号: ${companyData.representativePostalCode || "(なし)"}`);
+  console.log(`  代表者住所: ${companyData.representativeHomeAddress || "(なし)"}`);
+  console.log(`  代表者誕生日: ${companyData.representativeBirthDate || "(なし)"}`);
+  console.log(`  資本金: ${companyData.capitalStock !== null && companyData.capitalStock !== undefined ? companyData.capitalStock : "(なし)"}`);
+  console.log(`  上場: ${companyData.listing || "(なし)"}`);
+  console.log(`  決算月: ${companyData.fiscalMonth || "(なし)"}`);
+  console.log(`  売上: ${companyData.revenue !== null && companyData.revenue !== undefined ? companyData.revenue : "(なし)"}`);
+  console.log(`  利益: ${companyData.financials !== null && companyData.financials !== undefined ? companyData.financials : "(なし)"}`);
+  console.log(`  説明: ${companyData.companyDescription ? companyData.companyDescription.substring(0, 50) + "..." : "(なし)"}`);
+  console.log(`  概要: ${companyData.overview ? companyData.overview.substring(0, 50) + "..." : "(なし)"}`);
+  console.log(`  仕入れ先: ${JSON.stringify(companyData.suppliers)}`);
+  console.log(`  取引先: ${companyData.clients || "(なし)"}`);
+  console.log(`  取引先銀行: ${JSON.stringify(companyData.banks)}`);
+  console.log(`  取締役: ${companyData.executives || "(なし)"}`);
+  console.log(`  株主: ${companyData.shareholders || "(なし)"}`);
+  console.log(`  社員数: ${companyData.employeeCount !== null && companyData.employeeCount !== undefined ? companyData.employeeCount : "(なし)"}`);
+  console.log(`  オフィス数: ${companyData.officeCount !== null && companyData.officeCount !== undefined ? companyData.officeCount : "(なし)"}`);
+  console.log(`  工場数: ${companyData.factoryCount !== null && companyData.factoryCount !== undefined ? companyData.factoryCount : "(なし)"}`);
+  console.log(`  店舗数: ${companyData.storeCount !== null && companyData.storeCount !== undefined ? companyData.storeCount : "(なし)"}`);
+
+  console.log();
+
+  // 4. Firestoreに同じIDで新規作成
+  console.log("【STEP 4】Firestoreに同じIDで新規作成中...");
+  const docRef = db.collection(COLLECTION_NAME).doc(TYPE_J_DOC_ID);
+  await docRef.set(companyData);
+  console.log(`✓ 作成完了`);
+  console.log(`  ドキュメントID: ${TYPE_J_DOC_ID}`);
+
+  console.log();
+
+  // 5. 確認
+  console.log("【STEP 5】作成したデータを確認中...");
+  const newDocSnap = await docRef.get();
+  const newData = newDocSnap.data();
+  
+  if (newData) {
+    console.log(`✓ データ確認完了`);
+    console.log();
+    console.log("【フィールド確認】");
+    console.log(`  企業名: ${newData.name}`);
+    console.log(`  都道府県: ${newData.prefecture}`);
+    console.log(`  代表者名: ${newData.representativeName}`);
+    console.log(`  法人番号: ${newData.corporateNumber || "(なし)"}`);
+    console.log(`  住所: ${newData.address}`);
+    console.log(`  郵便番号: ${newData.postalCode || "(なし)"}`);
+    console.log(`  業種1: ${newData.industry || "(なし)"}`);
+    console.log(`  industryLarge: ${newData.industryLarge || "(なし)"}`);
+    console.log(`  industryMiddle: ${newData.industryMiddle || "(なし)"}`);
+    console.log(`  industrySmall: ${newData.industrySmall || "(なし)"}`);
+    console.log(`  業種配列: ${JSON.stringify(newData.industries)}`);
+    console.log(`  代表者郵便番号: ${newData.representativePostalCode || "(なし)"}`);
+    console.log(`  代表者住所: ${newData.representativeHomeAddress || "(なし)"}`);
+    console.log(`  代表者誕生日: ${newData.representativeBirthDate || "(なし)"}`);
+    console.log(`  資本金: ${newData.capitalStock !== null && newData.capitalStock !== undefined ? newData.capitalStock : "(なし)"}`);
+    console.log(`  上場: ${newData.listing || "(なし)"}`);
+    console.log(`  決算月: ${newData.fiscalMonth || "(なし)"}`);
+    console.log(`  売上: ${newData.revenue !== null && newData.revenue !== undefined ? newData.revenue : "(なし)"}`);
+    console.log(`  利益: ${newData.financials !== null && newData.financials !== undefined ? newData.financials : "(なし)"}`);
+    console.log(`  説明: ${newData.companyDescription ? newData.companyDescription.substring(0, 50) + "..." : "(なし)"}`);
+    console.log(`  概要: ${newData.overview ? newData.overview.substring(0, 50) + "..." : "(なし)"}`);
+    console.log(`  仕入れ先: ${JSON.stringify(newData.suppliers)}`);
+    console.log(`  取引先: ${newData.clients || "(なし)"}`);
+    console.log(`  取引先銀行: ${JSON.stringify(newData.banks)}`);
+    console.log(`  取締役: ${newData.executives || "(なし)"}`);
+    console.log(`  株主: ${newData.shareholders || "(なし)"}`);
+    console.log(`  社員数: ${newData.employeeCount !== null && newData.employeeCount !== undefined ? newData.employeeCount : "(なし)"}`);
+    console.log(`  オフィス数: ${newData.officeCount !== null && newData.officeCount !== undefined ? newData.officeCount : "(なし)"}`);
+    console.log(`  工場数: ${newData.factoryCount !== null && newData.factoryCount !== undefined ? newData.factoryCount : "(なし)"}`);
+    console.log(`  店舗数: ${newData.storeCount !== null && newData.storeCount !== undefined ? newData.storeCount : "(なし)"}`);
+    console.log();
+    
+    console.log("🎉 タイプJ（133.csv）の作成が完了しました！");
+  } else {
+    console.error("❌ データの確認に失敗しました");
+  }
+
+  console.log("\n================================================================================");
+  console.log("完了");
+  console.log("================================================================================");
+  console.log(`\n【タイプJのドキュメントID】`);
+  console.log(`タイプJ: ${TYPE_J_DOC_ID}`);
+  console.log(`CSVソース: ${CSV_PATH}（1行目）`);
+  console.log(`企業名: ${companyData.name}`);
+}
+
+main().then(() => process.exit(0)).catch((err) => {
+  console.error("予期しないエラー:", err);
+  process.exit(1);
+});
+
