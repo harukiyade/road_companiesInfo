@@ -63,3 +63,4 @@ git push
 
 # keep example file tracked
 !.env.example
+pref/00_zenkoku_all_20251226.zip

@@ -3,11 +3,14 @@
   
   使い方:
     GOOGLE_APPLICATION_CREDENTIALS=/path/to/serviceAccountKey.json \
-    npx tsx scripts/update_companies_from_gbizinfo_csv.ts
+    npx tsx scripts/update_companies_from_gbizinfo_csv.ts [CSVファイルのパス]
     
   オプション:
     --dry-run: 実際には更新せず、更新予定の内容を表示
     --limit=N: 処理する行数を制限（テスト用）
+    
+  環境変数:
+    CSV_FILE: CSVファイルのパス（引数より優先）
 */
 
 import * as fs from "fs";
@@ -23,7 +26,27 @@ import {
 import { createReadStream } from "fs";
 
 const COLLECTION_NAME = "companies_new";
-const CSV_FILE = path.join(__dirname, "../out/gBizINFO/companies_export.csv");
+
+// CSVファイルのパスを取得（環境変数 > 引数 > デフォルト）
+function getCsvFilePath(): string {
+  // 環境変数から取得
+  if (process.env.CSV_FILE) {
+    return path.resolve(process.env.CSV_FILE);
+  }
+  
+  // 引数から取得（--dry-runや--limit=以外の最初の引数）
+  const csvArg = process.argv.find(arg => 
+    !arg.startsWith("--") && arg.endsWith(".csv")
+  );
+  if (csvArg) {
+    return path.resolve(csvArg);
+  }
+  
+  // デフォルトパス
+  return path.join(__dirname, "../out/gBizINFO/companies_export.csv");
+}
+
+const CSV_FILE = getCsvFilePath();
 
 // ==============================
 // Firebase 初期化
@@ -175,35 +198,37 @@ interface CompanyDoc {
   data: Record<string, any>;
 }
 
-// バッチでドキュメントを検索（高速化のため）
+  // バッチでドキュメントを検索（高速化のため）
+// 法人番号で検索できない場合は、社名や住所で検索するフォールバックを追加
 async function findCompaniesBatch(
-  corporateNumbers: string[]
+  records: Array<{ record: Record<string, string>; rowNumber: number; corporateNumber: string }>
 ): Promise<Map<string, CompanyDoc>> {
   const result = new Map<string, CompanyDoc>();
   
-  if (corporateNumbers.length === 0) return result;
+  if (records.length === 0) return result;
   
-  // 1. docIdで直接参照を並列実行（高速化のポイント）
+  // 1. 法人番号でdocId直接参照を並列実行（高速化のポイント）
+  const corporateNumbers = records.map(r => r.corporateNumber);
   const directRefs = corporateNumbers
     .filter(corpNum => corpNum && corpNum.trim() !== "")
     .map(corpNum => companiesCol.doc(corpNum.trim()));
   
-  // 並列でget()を実行（最大500件まで）
+  // 並列でget()を実行（最大500件まで、Firestoreの制限）
   const BATCH_GET_SIZE = 500;
   for (let i = 0; i < directRefs.length; i += BATCH_GET_SIZE) {
     const batchRefs = directRefs.slice(i, i + BATCH_GET_SIZE);
-    const batchCorpNums = corporateNumbers.slice(i, i + BATCH_GET_SIZE);
+    const batchRecords = records.slice(i, i + BATCH_GET_SIZE);
     
     const directSnaps = await Promise.allSettled(
       batchRefs.map(ref => ref.get())
     );
     
     directSnaps.forEach((settled, index) => {
-      const corpNum = batchCorpNums[index]?.trim();
-      if (!corpNum) return;
+      const record = batchRecords[index];
+      if (!record) return;
       
       if (settled.status === "fulfilled" && settled.value.exists) {
-        result.set(corpNum, {
+        result.set(record.corporateNumber, {
           ref: batchRefs[index],
           data: settled.value.data() || {},
         });
@@ -211,19 +236,18 @@ async function findCompaniesBatch(
     });
   }
   
-  // 2. 見つからなかったものはwhereクエリで検索（並列実行数を制限）
-  const notFoundCorpNums = corporateNumbers.filter(
-    corpNum => corpNum && corpNum.trim() !== "" && !result.has(corpNum.trim())
+  // 2. 見つからなかったものはwhereクエリで法人番号検索（並列実行数を制限）
+  const notFoundRecords = records.filter(
+    r => r.corporateNumber && r.corporateNumber.trim() !== "" && !result.has(r.corporateNumber.trim())
   );
   
-  if (notFoundCorpNums.length > 0) {
-    // Firestoreの同時クエリ制限を考慮して並列実行数を制限
-    const CONCURRENT_QUERIES = 10;
-    for (let i = 0; i < notFoundCorpNums.length; i += CONCURRENT_QUERIES) {
-      const batch = notFoundCorpNums.slice(i, i + CONCURRENT_QUERIES);
+  if (notFoundRecords.length > 0) {
+    const CONCURRENT_QUERIES = process.env.CONCURRENT_QUERIES ? parseInt(process.env.CONCURRENT_QUERIES) : 40;
+    for (let i = 0; i < notFoundRecords.length; i += CONCURRENT_QUERIES) {
+      const batch = notFoundRecords.slice(i, i + CONCURRENT_QUERIES);
       const queryResults = await Promise.allSettled(
-        batch.map(corpNum => {
-          const normalizedCorpNum = corpNum.trim();
+        batch.map(record => {
+          const normalizedCorpNum = record.corporateNumber.trim();
           return companiesCol
             .where("corporateNumber", "==", normalizedCorpNum)
             .limit(1)
@@ -232,15 +256,100 @@ async function findCompaniesBatch(
       );
       
       queryResults.forEach((settled, batchIndex) => {
-        const corpNum = batch[batchIndex]?.trim();
-        if (!corpNum) return;
+        const record = batch[batchIndex];
+        if (!record) return;
         
         if (settled.status === "fulfilled" && !settled.value.empty) {
           const doc = settled.value.docs[0];
-          result.set(corpNum, {
+          result.set(record.corporateNumber, {
             ref: doc.ref,
             data: doc.data() || {},
           });
+        }
+      });
+    }
+  }
+  
+  // 3. まだ見つからなかったものは、社名で検索（法人番号がnullのドキュメントを探す）
+  const stillNotFoundRecords = records.filter(
+    r => r.corporateNumber && r.corporateNumber.trim() !== "" && !result.has(r.corporateNumber.trim())
+  );
+  
+  if (stillNotFoundRecords.length > 0) {
+    const CONCURRENT_QUERIES = process.env.CONCURRENT_QUERIES ? parseInt(process.env.CONCURRENT_QUERIES) : 40;
+    for (let i = 0; i < stillNotFoundRecords.length; i += CONCURRENT_QUERIES) {
+      const batch = stillNotFoundRecords.slice(i, i + CONCURRENT_QUERIES);
+      const queryResults = await Promise.allSettled(
+        batch.map(record => {
+          const name = record.record["name"]?.trim();
+          if (!name) {
+            return Promise.resolve({ empty: true, docs: [] } as any);
+          }
+          
+          // 社名で検索（法人番号がnullのドキュメントも含む）
+          return companiesCol
+            .where("name", "==", name)
+            .limit(10) // 同名企業がある可能性があるため、複数取得
+            .get();
+        })
+      );
+      
+      queryResults.forEach((settled, batchIndex) => {
+        const record = batch[batchIndex];
+        if (!record) return;
+        
+        if (settled.status === "fulfilled" && !settled.value.empty) {
+          const docs = settled.value.docs;
+          const csvName = record.record["name"]?.trim();
+          const csvAddress = record.record["address"]?.trim();
+          
+          // 最も一致するドキュメントを選択
+          // 優先順位: 1) 法人番号がnull + 住所が一致 2) 法人番号がnull 3) 住所が一致
+          let bestMatch = null;
+          let bestScore = 0;
+          
+          for (const doc of docs) {
+            const docData = doc.data();
+            const docCorpNum = docData.corporateNumber;
+            const docAddress = docData.address?.trim();
+            const docName = docData.name?.trim();
+            
+            // 社名が完全一致することを確認
+            if (docName !== csvName) continue;
+            
+            let score = 0;
+            
+            // 法人番号がnullの場合、スコア+10
+            if (isNullish(docCorpNum)) {
+              score += 10;
+            }
+            
+            // 住所が一致する場合、スコア+5
+            if (csvAddress && docAddress) {
+              // 住所の最初の部分（都道府県+市区町村）が一致するか確認
+              const csvAddrStart = csvAddress.substring(0, Math.min(20, csvAddress.length));
+              const docAddrStart = docAddress.substring(0, Math.min(20, docAddress.length));
+              if (csvAddrStart === docAddrStart || 
+                  docAddress.includes(csvAddrStart) || 
+                  csvAddress.includes(docAddrStart)) {
+                score += 5;
+              }
+            }
+            
+            // より高いスコアのドキュメントを選択
+            if (score > bestScore) {
+              bestScore = score;
+              bestMatch = doc;
+            }
+          }
+          
+          // 最適なマッチが見つかった場合のみ追加（スコアが5以上）
+          if (bestMatch && bestScore >= 5) {
+            result.set(record.corporateNumber, {
+              ref: bestMatch.ref,
+              data: bestMatch.data() || {},
+            });
+          }
         }
       });
     }
@@ -253,6 +362,65 @@ async function findCompaniesBatch(
 // チャンク処理関数
 // ==============================
 
+// CSVからcompanies_newコレクション用のデータを構築
+function buildCompanyDataFromCsv(
+  record: Record<string, string>,
+  header: string[]
+): Record<string, any> | null {
+  // 最低限、nameまたはcorporateNumberが必要
+  const name = record["name"]?.trim();
+  const corporateNumber = record["corporateNumber"]?.trim();
+  
+  if (!name && !corporateNumber) {
+    return null; // 必須情報がない場合はスキップ
+  }
+  
+  // companies_newコレクションの基本テンプレート（配列フィールドは空配列）
+  const data: Record<string, any> = {
+    industries: [],
+    businessItems: [],
+    tags: [],
+    urls: [],
+    banks: [],
+    suppliers: [],
+    clients: [],
+    subsidiaries: [],
+    shareholders: [],
+    badges: [],
+  };
+  
+  // CSVの各フィールドをマッピング
+  for (const fieldName of header) {
+    const csvValue = convertValue(record[fieldName], fieldName);
+    
+    // nullでない値のみ設定
+    if (!isNullish(csvValue)) {
+      data[fieldName] = csvValue;
+    } else {
+      // nullの場合は、配列フィールドは空配列、それ以外はnull
+      if (fieldName === "industries" || fieldName === "businessItems" || 
+          fieldName === "tags" || fieldName === "urls" || fieldName === "banks" ||
+          fieldName === "suppliers" || fieldName === "clients" || 
+          fieldName === "subsidiaries" || fieldName === "shareholders" ||
+          fieldName === "badges") {
+        data[fieldName] = [];
+      } else {
+        data[fieldName] = null;
+      }
+    }
+  }
+  
+  // タイムスタンプを設定
+  const now = admin.firestore.Timestamp.now();
+  data.createdAt = now;
+  data.updatedAt = now;
+  data.updateDate = now.toDate().toISOString().split("T")[0];
+  data.updateCount = 0;
+  data.changeCount = 0;
+  
+  return data;
+}
+
 // チャンクを処理する関数（高速化のため）
 async function processChunk(
   records: Array<{ record: Record<string, string>; rowNumber: number }>,
@@ -262,8 +430,15 @@ async function processChunk(
     updatedCount: number;
     notFoundCount: number;
     skippedCount: number;
+    foundButNoUpdateCount: number;
+    csvEmptyCount: number;
+    existingHasValueCount: number;
+    createdCount: number;
   }
-): Promise<Array<{ docRef: DocumentReference; updateData: Record<string, any> }>> {
+): Promise<{
+  updates: Array<{ docRef: DocumentReference; updateData: Record<string, any> }>;
+  creates: Array<{ docRef: DocumentReference; createData: Record<string, any> }>;
+}> {
   // 法人番号でフィルタリング
   const validRecords = records
     .map(({ record, rowNumber }) => {
@@ -274,21 +449,35 @@ async function processChunk(
   
   if (validRecords.length === 0) {
     stats.skippedCount += records.length;
-    return [];
+    return { updates: [], creates: [] };
   }
   
   // バッチでドキュメントを検索（高速化のポイント）
-  const corporateNumbers = validRecords.map(r => r.corporateNumber);
-  const docMap = await findCompaniesBatch(corporateNumbers);
+  // 法人番号で検索できない場合は、社名や住所で検索するフォールバックを追加
+  const docMap = await findCompaniesBatch(validRecords);
   
-  // 更新データを構築
+  // 更新データと新規作成データを構築
   const updates: Array<{ docRef: DocumentReference; updateData: Record<string, any> }> = [];
+  const creates: Array<{ docRef: DocumentReference; createData: Record<string, any> }> = [];
   
   for (const { record, rowNumber, corporateNumber } of validRecords) {
     const companyDoc = docMap.get(corporateNumber);
     
     if (!companyDoc) {
-      stats.notFoundCount++;
+      // 見つからない場合は新規作成
+      const createData = buildCompanyDataFromCsv(record, header);
+      if (createData) {
+        // docIdは法人番号を使用（13桁の数値であることを確認）
+        const docId = /^\d{13}$/.test(corporateNumber.trim()) 
+          ? corporateNumber.trim() 
+          : companiesCol.doc().id; // 法人番号が無効な場合は自動生成
+        const docRef = companiesCol.doc(docId);
+        creates.push({ docRef, createData });
+        stats.createdCount++;
+        stats.processedCount++;
+      } else {
+        stats.notFoundCount++;
+      }
       continue;
     }
     
@@ -299,17 +488,55 @@ async function processChunk(
     let hasUpdate = false;
     
     for (const fieldName of header) {
-      // corporateNumberは更新しない
-      if (fieldName === "corporateNumber") continue;
-      
       const csvValue = convertValue(record[fieldName], fieldName);
       const existingValue = existingData[fieldName];
+      
+      // corporateNumberの特別処理
+      if (fieldName === "corporateNumber") {
+        // 既存の値がnull/undefined/空文字列の場合のみ更新
+        // ただし、CSVの値が有効な13桁の法人番号であることを確認
+        if (isNullish(existingValue) && !isNullish(csvValue)) {
+          const corpNum = String(csvValue).trim();
+          // 13桁の数値であることを確認
+          if (/^\d{13}$/.test(corpNum)) {
+            updateData[fieldName] = corpNum;
+            hasUpdate = true;
+          }
+        }
+        continue;
+      }
       
       // 既存の値がnull/undefined/空文字列の場合のみ更新
       if (isNullish(existingValue) && !isNullish(csvValue)) {
         updateData[fieldName] = csvValue;
         hasUpdate = true;
       }
+    }
+    
+    // 更新されなかった場合の理由を記録（最初の100件のみ）
+    if (!hasUpdate && stats.foundButNoUpdateCount < 100) {
+      let csvEmpty = true;
+      let existingHasValue = false;
+      
+      for (const fieldName of header) {
+        const csvValue = convertValue(record[fieldName], fieldName);
+        const existingValue = existingData[fieldName];
+        
+        if (!isNullish(csvValue)) {
+          csvEmpty = false;
+        }
+        if (!isNullish(existingValue)) {
+          existingHasValue = true;
+        }
+      }
+      
+      if (csvEmpty) {
+        stats.csvEmptyCount++;
+      }
+      if (existingHasValue) {
+        stats.existingHasValueCount++;
+      }
+      stats.foundButNoUpdateCount++;
     }
     
     if (hasUpdate) {
@@ -322,7 +549,7 @@ async function processChunk(
   
   stats.skippedCount += records.length - validRecords.length;
   
-  return updates;
+  return { updates, creates };
 }
 
 // ==============================
@@ -332,6 +559,11 @@ async function processChunk(
 async function processCsv(): Promise<void> {
   if (!fs.existsSync(CSV_FILE)) {
     log(`❌ エラー: CSVファイルが見つかりません: ${CSV_FILE}`);
+    log(``);
+    log(`📝 CSVファイルを指定する方法:`);
+    log(`   1. 引数として指定: npx tsx scripts/update_companies_from_gbizinfo_csv.ts /path/to/file.csv`);
+    log(`   2. 環境変数で指定: CSV_FILE=/path/to/file.csv npx tsx scripts/update_companies_from_gbizinfo_csv.ts`);
+    log(`   3. デフォルトパスに配置: ${path.join(__dirname, "../out/gBizINFO/companies_export.csv")}`);
     process.exit(1);
   }
   
@@ -344,9 +576,11 @@ async function processCsv(): Promise<void> {
   let notFoundCount = 0;
   let skippedCount = 0;
   
-  const BATCH_SIZE = 500; // Firestoreバッチサイズ
-  const CHUNK_SIZE = 2000; // チャンクサイズ（高速化のため）
-  const CONCURRENT_CHUNKS = 5; // 並列処理するチャンク数（高速化のため）
+  const BATCH_SIZE = 500; // Firestoreバッチサイズ（変更不可：Firestoreの制限）
+  // 環境変数で調整可能、デフォルト値をメモリ効率的な設定に変更
+  const CHUNK_SIZE = process.env.CHUNK_SIZE ? parseInt(process.env.CHUNK_SIZE) : 5000; // チャンクサイズ（メモリ効率重視）
+  const CONCURRENT_CHUNKS = process.env.CONCURRENT_CHUNKS ? parseInt(process.env.CONCURRENT_CHUNKS) : 20; // 並列処理するチャンク数（メモリ効率重視）
+  const MAX_BUFFER_SIZE = CHUNK_SIZE * CONCURRENT_CHUNKS * 1.2; // 最大バッファサイズ（メモリ保護、1.2倍に調整）
   
   // バッチ管理（スレッドセーフ）
   let batch: WriteBatch | null = null;
@@ -361,8 +595,12 @@ async function processCsv(): Promise<void> {
   const stats = {
     processedCount: 0,
     updatedCount: 0,
+    createdCount: 0, // 新規作成件数
     notFoundCount: 0,
     skippedCount: 0,
+    foundButNoUpdateCount: 0, // 見つかったが更新されなかった件数
+    csvEmptyCount: 0, // CSVの値が空だった件数
+    existingHasValueCount: 0, // 既存の値がnullでなかった件数
   };
   
   // バッチコミット関数（スレッドセーフ）
@@ -385,14 +623,19 @@ async function processCsv(): Promise<void> {
         await currentBatch.commit();
       }
       
-      log(`  📝 進行中: ${stats.processedCount.toLocaleString()} 社処理、${updatedCount.toLocaleString()} 社更新`);
+      // 進捗ログのみ出力
+      log(`  📝 進行中: ${stats.processedCount.toLocaleString()} 社処理、${updatedCount.toLocaleString()} 社更新、${stats.createdCount.toLocaleString()} 社新規作成`);
     } finally {
       batchLock = false;
     }
   }
   
-  // バッチに更新を追加（スレッドセーフ）
-  async function addToBatch(updates: Array<{ docRef: DocumentReference; updateData: Record<string, any> }>) {
+  // バッチに更新と新規作成を追加（スレッドセーフ）
+  async function addToBatch(
+    updates: Array<{ docRef: DocumentReference; updateData: Record<string, any> }>,
+    creates: Array<{ docRef: DocumentReference; createData: Record<string, any> }>
+  ) {
+    // 更新を追加
     for (const { docRef, updateData } of updates) {
       // バッチロックを取得
       while (batchLock) {
@@ -403,17 +646,34 @@ async function processCsv(): Promise<void> {
         batch = db.batch();
       }
       
-      if (DRY_RUN) {
-        if (updatedCount < 10) {
-          log(`  🔍 DRY RUN - 更新予定: docId=${docRef.id}, フィールド数=${Object.keys(updateData).length}`);
-          log(`    更新フィールド: ${Object.keys(updateData).join(", ")}`);
-        }
-      } else {
+      if (!DRY_RUN) {
         batch.update(docRef, updateData);
         batchCount++;
       }
       
       updatedCount++;
+      
+      // バッチコミット
+      if (batchCount >= BATCH_SIZE) {
+        await commitBatch();
+      }
+    }
+    
+    // 新規作成を追加
+    for (const { docRef, createData } of creates) {
+      // バッチロックを取得
+      while (batchLock) {
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      
+      if (!batch) {
+        batch = db.batch();
+      }
+      
+      if (!DRY_RUN) {
+        batch.set(docRef, createData);
+        batchCount++;
+      }
       
       // バッチコミット
       if (batchCount >= BATCH_SIZE) {
@@ -427,10 +687,10 @@ async function processCsv(): Promise<void> {
     if (chunkBuffer.length === 0) return;
     
     const chunk = chunkBuffer.splice(0, CHUNK_SIZE);
-    const updates = await processChunk(chunk, header, stats);
+    const { updates, creates } = await processChunk(chunk, header, stats);
     
     // バッチに追加（スレッドセーフ）
-    await addToBatch(updates);
+    await addToBatch(updates, creates);
   }
   
   // 複数のチャンクを並列処理（残りのチャンクを処理する場合に使用）
@@ -459,6 +719,7 @@ async function processCsv(): Promise<void> {
       relax_quotes: true,
       relax_column_count: true,
       bom: true,
+      skip_records_with_error: true, // エラー行をスキップして続行
     });
     
     // 処理完了関数
@@ -501,8 +762,13 @@ async function processCsv(): Promise<void> {
       log(`📊 総行数: ${rowCount.toLocaleString()}`);
       log(`📝 処理済み: ${processedCount.toLocaleString()} 社`);
       log(`✅ 更新: ${updatedCount.toLocaleString()} 社`);
+      log(`🆕 新規作成: ${stats.createdCount.toLocaleString()} 社`);
       log(`⚠️  見つからない: ${notFoundCount.toLocaleString()} 社`);
       log(`⏭️  スキップ: ${skippedCount.toLocaleString()} 行（法人番号なし）`);
+      log(`\n🔍 更新されなかった理由（最初の100件の分析）:`);
+      log(`   - 見つかったが更新なし: ${stats.foundButNoUpdateCount} 社`);
+      log(`   - CSVの値が空: ${stats.csvEmptyCount} 社`);
+      log(`   - 既存の値がnullでない: ${stats.existingHasValueCount} 社`);
       
       resolve();
     }
@@ -515,17 +781,11 @@ async function processCsv(): Promise<void> {
         if (DRY_RUN) {
           log("🔍 DRY_RUN モード: 実際には更新しません");
         }
-        log(`⚡ 高速化モード: チャンクサイズ ${CHUNK_SIZE}, バッチサイズ ${BATCH_SIZE}, 並列チャンク数 ${CONCURRENT_CHUNKS}`);
         log("📊 データ処理を開始します...");
       })
       .on("data", async (record: Record<string, string>) => {
         if (isPaused) return;
         rowCount++;
-        
-        // 最初の数行でログ出力
-        if (rowCount <= 5) {
-          log(`  📄 行 ${rowCount} を読み込み中... (corporateNumber: ${record["corporateNumber"]?.substring(0, 13) || "なし"})`);
-        }
         
         if (LIMIT && rowCount > LIMIT) {
           if (!isPaused) {
@@ -545,6 +805,32 @@ async function processCsv(): Promise<void> {
         
         // チャンクバッファに追加
         chunkBuffer.push({ record, rowNumber: rowCount });
+        
+        // メモリ保護: バッファサイズが上限に達したら、処理を待機（より積極的に）
+        if (chunkBuffer.length >= MAX_BUFFER_SIZE) {
+          parser.pause();
+          // 並列処理が完了するまで待機（複数回待機してメモリを解放）
+          while (activeChunks.size > 0 && chunkBuffer.length >= MAX_BUFFER_SIZE * 0.8) {
+            await Promise.race(Array.from(activeChunks));
+            // ガベージコレクションを促すために少し待機
+            await new Promise(resolve => setTimeout(resolve, 10));
+          }
+          if (!isPaused) {
+            parser.resume();
+          }
+        }
+        
+        // 早期メモリ保護: バッファサイズが上限の80%に達したら、処理を待機
+        if (chunkBuffer.length >= MAX_BUFFER_SIZE * 0.8 && activeChunks.size >= CONCURRENT_CHUNKS) {
+          parser.pause();
+          // 1つ以上のチャンクが完了するまで待機
+          while (activeChunks.size >= CONCURRENT_CHUNKS && chunkBuffer.length >= MAX_BUFFER_SIZE * 0.8) {
+            await Promise.race(Array.from(activeChunks));
+          }
+          if (!isPaused) {
+            parser.resume();
+          }
+        }
         
         // チャンクサイズに達したら並列処理開始
         if (chunkBuffer.length >= CHUNK_SIZE) {
@@ -569,8 +855,9 @@ async function processCsv(): Promise<void> {
           activeChunks.add(chunkPromise);
         }
         
-        if (rowCount % 10000 === 0) {
-          log(`  📊 読み込み中: ${rowCount.toLocaleString()} 行、バッファ: ${chunkBuffer.length} 件`);
+        // 進捗ログ（100000行ごと）
+        if (rowCount % 100000 === 0) {
+          log(`  📊 読み込み中: ${rowCount.toLocaleString()} 行`);
         }
       })
       .on("end", async () => {
@@ -589,6 +876,7 @@ async function processCsv(): Promise<void> {
 
 async function main() {
   log("🚀 gBizINFO CSV統合結果の反映開始");
+  log(`📁 使用するCSVファイル: ${CSV_FILE}`);
   
   try {
     await processCsv();
