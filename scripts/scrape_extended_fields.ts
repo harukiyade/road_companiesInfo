@@ -56,47 +56,86 @@
 import admin from "firebase-admin";
 import * as fs from "fs";
 import * as path from "path";
-import { chromium, Browser, Page } from "playwright";
+import { chromium, Browser, Page, ElementHandle } from "playwright";
 import * as cheerio from "cheerio";
 import { parse } from "csv-parse/sync";
 import { parse as parseStream } from "csv-parse";
 import { createReadStream } from "fs";
 import fetch from "node-fetch";
+import { Pool, Client } from "pg";
 
 // ------------------------------
-// Firebase Admin SDK 初期化
+// Firebase Admin SDK 初期化（オプショナル - CloudSQLのみの場合は不要）
 // ------------------------------
+let db: admin.firestore.Firestore | null = null;
+
 if (!admin.apps.length) {
+  const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_KEY;
+  
+  if (serviceAccountPath && fs.existsSync(serviceAccountPath)) {
+    try {
+      const serviceAccount = JSON.parse(
+        fs.readFileSync(serviceAccountPath, "utf8")
+      );
+
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+        projectId: "albert-ma",
+      });
+
+      db = admin.firestore();
+      console.log("[Firebase初期化] ✅ 初期化が完了しました（オプショナル）");
+    } catch (error) {
+      console.log("[Firebase初期化] ⚠️  Firestore初期化をスキップします（CloudSQLのみ使用）");
+    }
+  } else {
+    console.log("[Firebase初期化] ⚠️  Firestore初期化をスキップします（CloudSQLのみ使用）");
+  }
+} else {
+  db = admin.firestore();
+}
+
+// ------------------------------
+// CloudSQL (PostgreSQL) 接続設定
+// ------------------------------
+let pgPool: Pool | null = null;
+
+function initPostgres(): Pool | null {
+  const postgresHost = process.env.POSTGRES_HOST;
+  const postgresPort = process.env.POSTGRES_PORT || "5432";
+  // デフォルトはpostgresデータベース（companies_dbが存在しない場合に備える）
+  const postgresDb = process.env.POSTGRES_DB || "postgres";
+  const postgresUser = process.env.POSTGRES_USER || "postgres";
+  const postgresPassword = process.env.POSTGRES_PASSWORD;
+
+  // CloudSQL接続情報が設定されていない場合はエラー
+  if (!postgresHost || !postgresPassword) {
+    console.error("❌ エラー: CloudSQL接続情報が設定されていません。");
+    console.error("  以下の環境変数を設定してください:");
+    console.error("  - POSTGRES_HOST");
+    console.error("  - POSTGRES_PASSWORD");
+    process.exit(1);
+  }
+
   try {
-    const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_KEY;
-
-    if (!serviceAccountPath) {
-      console.error("❌ エラー: FIREBASE_SERVICE_ACCOUNT_KEY 環境変数が設定されていません。");
-      process.exit(1);
-    }
-
-    if (!fs.existsSync(serviceAccountPath)) {
-      console.error(`❌ エラー: サービスアカウントキーファイルが存在しません: ${serviceAccountPath}`);
-      process.exit(1);
-    }
-
-    const serviceAccount = JSON.parse(
-      fs.readFileSync(serviceAccountPath, "utf8")
-    );
-
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-      projectId: "albert-ma",
+    const pool = new Pool({
+      host: postgresHost,
+      port: parseInt(postgresPort, 10),
+      database: postgresDb,
+      user: postgresUser,
+      password: postgresPassword,
+      max: 5, // 接続プールの最大接続数
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 10000,
     });
 
-    console.log("[Firebase初期化] ✅ 初期化が完了しました");
+    console.log(`[CloudSQL] ✅ PostgreSQL接続プールを初期化しました: ${postgresHost}:${postgresPort}/${postgresDb}`);
+    return pool;
   } catch (error) {
-    console.error("❌ Firebase初期化エラー:", error);
+    console.error(`❌ CloudSQL接続エラー: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
   }
 }
-
-const db = admin.firestore();
 
 // ------------------------------
 // 設定
@@ -415,6 +454,97 @@ function isValidUrl(url: string | null | undefined): boolean {
   }
 }
 
+// ------------------------------
+// 保存直前のクリーニング（URL/住所）
+// ------------------------------
+/**
+ * "http" から始まるURL部分だけを抽出する（日本語などの混入テキストを除外）
+ * 例: "http://example.com電話番号-設立..." -> "http://example.com"
+ */
+const HTTP_URL_EXTRACT_REGEX =
+  /https?:\/\/[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+/;
+
+function extractFirstHttpUrl(input: string): string | null {
+  const m = input.match(HTTP_URL_EXTRACT_REGEX);
+  return m ? m[0] : null;
+}
+
+function cleanUrlBeforeSave(url: string | null | undefined): string | null {
+  if (!url || typeof url !== "string") return null;
+  const trimmed = url.trim();
+  if (trimmed.length === 0) return null;
+
+  const extracted = extractFirstHttpUrl(trimmed);
+  return extracted || trimmed;
+}
+
+/**
+ * 住所から「/地図」「Googleマップで表示」等の不要文言を削除
+ */
+function cleanAddressBeforeSave(address: string | null | undefined): string | null {
+  if (!address || typeof address !== "string") return null;
+  let s = address.replace(/\s+/g, " ").trim();
+  if (s.length === 0) return null;
+
+  // 代表的な混入パターンを末尾から除去（住所 + 余計な案内文が連結されるケースに対応）
+  const trailingCutPatterns: RegExp[] = [
+    /\/地図.*$/u,
+    /Google\s*マップで表示.*$/u,
+    /Google\s*マップ.*$/u,
+    /Google\s*Maps?.*$/iu,
+    /地図を表示.*$/u,
+    /地図を見る.*$/u,
+  ];
+  for (const p of trailingCutPatterns) {
+    s = s.replace(p, "");
+  }
+
+  // 単独で混入することがある文言も削除
+  s = s
+    .replace(/Google\s*マップで表示/gu, "")
+    .replace(/Google\s*マップ/gu, "")
+    .replace(/\/地図/gu, "")
+    .trim();
+
+  // 余計な空白を再度整理
+  s = s.replace(/\s+/g, " ").trim();
+  return s.length === 0 ? null : s;
+}
+
+function cleanUrlArrayBeforeSave(urls: unknown): string[] | null {
+  if (!Array.isArray(urls)) return null;
+  const cleaned = urls
+    .map((u) => (typeof u === "string" ? cleanUrlBeforeSave(u) : null))
+    .filter((u): u is string => !!u && u.trim().length > 0);
+  return cleaned.length > 0 ? Array.from(new Set(cleaned)) : null;
+}
+
+/**
+ * 保存処理の直前に、URL/住所系フィールドをクリーニングして返す
+ */
+function sanitizeScrapedDataForSave(scrapedData: Partial<ScrapedData>): Partial<ScrapedData> {
+  const data: Partial<ScrapedData> = { ...scrapedData };
+
+  // URL類
+  if (data.companyUrl) data.companyUrl = cleanUrlBeforeSave(data.companyUrl) || data.companyUrl;
+  if (data.contactFormUrl) data.contactFormUrl = cleanUrlBeforeSave(data.contactFormUrl) || data.contactFormUrl;
+  if ((data as any).profileUrl) (data as any).profileUrl = cleanUrlBeforeSave((data as any).profileUrl) || (data as any).profileUrl;
+
+  // SNS/urls配列（存在する場合）
+  const cleanedUrls = cleanUrlArrayBeforeSave((data as any).urls);
+  if (cleanedUrls) (data as any).urls = cleanedUrls;
+  const cleanedSns = cleanUrlArrayBeforeSave((data as any).sns);
+  if (cleanedSns) (data as any).sns = cleanedSns;
+
+  // 住所類
+  if (data.address) data.address = cleanAddressBeforeSave(data.address) || data.address;
+  if (data.headquartersAddress) data.headquartersAddress = cleanAddressBeforeSave(data.headquartersAddress) || data.headquartersAddress;
+  if (data.representativeHomeAddress) data.representativeHomeAddress = cleanAddressBeforeSave(data.representativeHomeAddress) || data.representativeHomeAddress;
+  if (data.representativeRegisteredAddress) data.representativeRegisteredAddress = cleanAddressBeforeSave(data.representativeRegisteredAddress) || data.representativeRegisteredAddress;
+
+  return data;
+}
+
 /**
  * 生年月日が正常な値かどうかを検証
  */
@@ -731,7 +861,7 @@ async function loginToCnavi(page: Page): Promise<boolean> {
       try {
         const loginLink = await page.$('a[href*="login"], a:has-text("ログイン"), button:has-text("ログイン")');
         if (loginLink) {
-          await loginLink.click();
+          await loginLink.click({ force: true }).catch(() => {});
           await page.waitForNavigation({ waitUntil: "networkidle", timeout: NAVIGATION_TIMEOUT * 2 });
           await sleep(Math.max(SLEEP_MS * 3, MIN_SLEEP_MS_LONG * 2)); // 最小待機時間（高速化モード対応）
         }
@@ -780,7 +910,7 @@ async function loginToCnavi(page: Page): Promise<boolean> {
       'input[placeholder*="email"]',
     ];
 
-    let emailInput = null;
+    let emailInput: ElementHandle | null = null;
     for (const selector of emailSelectors) {
       try {
         // まずターゲットフレームで探す
@@ -814,7 +944,7 @@ async function loginToCnavi(page: Page): Promise<boolean> {
           // 要素が表示されるまで待つ
           await sleep(500); // より長い待機時間
           // 既に値が入っている場合はクリアしてから入力
-          await emailInput.click({ clickCount: 3 }); // 全選択
+          await emailInput.click({ clickCount: 3, force: true }).catch(() => {}); // 全選択
           await emailInput.fill(CNAVI_EMAIL);
           writeLog(`[Cnavi] メールアドレス入力成功: ${selector}`);
           break;
@@ -851,7 +981,7 @@ async function loginToCnavi(page: Page): Promise<boolean> {
       'input[id*="Password"]',
     ];
 
-    let passwordInput = null;
+    let passwordInput: ElementHandle | null = null;
     for (const selector of passwordSelectors) {
       try {
         // まずターゲットフレームで探す
@@ -900,7 +1030,7 @@ async function loginToCnavi(page: Page): Promise<boolean> {
       'input[type="submit"]',
     ];
 
-    let loginButton = null;
+    let loginButton: ElementHandle | null = null;
     for (const selector of loginButtonSelectors) {
       try {
         // まずターゲットフレームで探す
@@ -924,7 +1054,7 @@ async function loginToCnavi(page: Page): Promise<boolean> {
           // 要素が表示されるまで待つ（要素が見つかった時点で表示されていると仮定）
           // 必要に応じて短い待機時間を追加
           await sleep(100);
-          await loginButton.click();
+          await loginButton.click({ force: true }).catch(() => {});
           writeLog(`[Cnavi] ログインボタンクリック成功: ${selector}`);
           break;
         }
@@ -1022,26 +1152,51 @@ async function scrapeFromCnavi(
     });
     await sleep(Math.max(SLEEP_MS * 2, MIN_SLEEP_MS_LONG * 2)); // ページ読み込みを待つ
 
-    // 広告を閉じる（右上の×ボタンなど）
+    // ポップアップ・広告を閉じる（強化版）
     try {
-      const closeAdButtons = await page.$$('button:has-text("×"), button[aria-label*="閉じる"], .close, [class*="close"], button.close, [class*="ad-close"], [class*="modal-close"]');
-      for (const closeBtn of closeAdButtons) {
+      // モーダル、オーバーレイ、ポップアップを閉じる
+      const popupSelectors = [
+        'button:has-text("×")',
+        'button[aria-label*="閉じる"]',
+        'button[aria-label*="close"]',
+        '.close',
+        '[class*="close"]',
+        'button.close',
+        '[class*="ad-close"]',
+        '[class*="modal-close"]',
+        '[class*="popup-close"]',
+        '[class*="overlay-close"]',
+        'button[class*="close"]',
+        '[id*="close"]',
+        '[data-dismiss="modal"]',
+        '[data-close]'
+      ];
+      
+      for (const selector of popupSelectors) {
         try {
-          const isVisible = await closeBtn.isVisible();
-          if (isVisible) {
-            await closeBtn.click();
-            await sleep(Math.max(SLEEP_MS, FAST_MODE ? 200 : 300));
+          await page.waitForSelector(selector, { timeout: 2000, state: 'visible' }).catch(() => {});
+          const closeButtons = await page.$$(selector);
+          for (const closeBtn of closeButtons) {
+            try {
+              const isVisible = await closeBtn.isVisible();
+              if (isVisible) {
+                await closeBtn.click({ timeout: 3000, force: true }).catch(() => {});
+                await sleep(Math.max(SLEEP_MS, FAST_MODE ? 200 : 300));
+              }
+            } catch {
+              // 個別のボタンクリックエラーは無視
+            }
           }
         } catch {
-          // 広告が存在しない場合はスキップ
+          // セレクターが見つからない場合はスキップ
         }
       }
     } catch {
       // 広告閉じ処理のエラーは無視
     }
 
-    // 「企業名で探す」のテキストボックスを探す（複数のセレクターを試行）
-    let companyNameInput = null;
+    // 「企業名で探す」のテキストボックスを探す（waitForSelectorで待機）
+    let companyNameInput: ElementHandle | null = null;
     const searchSelectors = [
       'input[placeholder*="企業名"]',
       'input[placeholder*="法人格"]',
@@ -1055,6 +1210,8 @@ async function scrapeFromCnavi(
     
     for (const selector of searchSelectors) {
       try {
+        // 要素が表示されるまで待機
+        await page.waitForSelector(selector, { timeout: 5000, state: 'visible' }).catch(() => {});
         companyNameInput = await page.$(selector);
         if (companyNameInput) {
           const isVisible = await companyNameInput.isVisible();
@@ -1068,18 +1225,33 @@ async function scrapeFromCnavi(
     }
 
     if (companyNameInput) {
-      await companyNameInput.fill(companyName);
+      // ポップアップ/広告で入力が阻害されることがあるため、forceクリック→入力
+      await companyNameInput.click({ force: true, timeout: 3000 }).catch(() => {});
+      try {
+        await companyNameInput.fill(companyName);
+      } catch {
+        await page.keyboard.type(companyName, { delay: 10 }).catch(() => {});
+      }
       await sleep(Math.max(SLEEP_MS, MIN_SLEEP_MS)); // 最小待機時間（高速化モード対応）
     } else {
       writeLog(`  [Cnavi] 検索ボックスが見つかりません: ${companyName}`);
       return data;
     }
 
-    // 「検索する」ボタンを押下
+    // 「検索する」ボタンを押下（waitForSelectorで待機）
+    try {
+      await page.waitForSelector('button:has-text("検索する"), button[type="submit"]', { timeout: 5000, state: 'visible' }).catch(() => {});
+    } catch {
+      // ボタンが見つからない場合は続行
+    }
+    
     const searchButton = await page.$('button:has-text("検索する"), button[type="submit"]');
     if (searchButton) {
-      await searchButton.click();
-      await page.waitForNavigation({ waitUntil: PAGE_WAIT_MODE, timeout: NAVIGATION_TIMEOUT }).catch(() => {});
+      // クリックと同時に遷移するため、Promise.allで待機（遷移取りこぼし防止）
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: PAGE_WAIT_MODE, timeout: NAVIGATION_TIMEOUT }).catch(() => {}),
+        searchButton.click({ force: true }).catch(() => {}),
+      ]);
       await sleep(Math.max(SLEEP_MS, MIN_SLEEP_MS_LONG)); // 最小待機時間（高速化モード対応）
     }
 
@@ -1101,8 +1273,10 @@ async function scrapeFromCnavi(
         if (!headquartersAddress || rowText.includes(headquartersAddress.substring(0, 5))) {
           const companyLink = await row.$('a, [href*="/company/"], [href*="/detail/"]');
           if (companyLink) {
-            await companyLink.click();
-            await page.waitForNavigation({ waitUntil: PAGE_WAIT_MODE, timeout: NAVIGATION_TIMEOUT }).catch(() => {});
+            await Promise.all([
+              page.waitForNavigation({ waitUntil: PAGE_WAIT_MODE, timeout: NAVIGATION_TIMEOUT }).catch(() => {}),
+              companyLink.click({ force: true }).catch(() => {}),
+            ]);
             await sleep(Math.max(SLEEP_MS, MIN_SLEEP_MS_LONG)); // 最小待機時間（高速化モード対応）
             foundCompany = true;
             break;
@@ -1574,13 +1748,47 @@ async function scrapeFromHomepage(
           const url = new URL(href, homepageUrl).href;
           if (isValidUrl(url)) {
             data.contactFormUrl = url;
+            // 問い合わせフォームURLからルートURL（HPのURL）を抽出
+            try {
+              const contactUrlObj = new URL(url);
+              const rootUrl = `${contactUrlObj.protocol}//${contactUrlObj.host}`;
+              if (isValidUrl(rootUrl)) {
+                data.companyUrl = rootUrl;
+              }
+            } catch {
+              // URL解析エラー時はスキップ
+            }
           }
         } catch {
           const url = href.startsWith("http") ? href : `${homepageUrl}${href}`;
           if (isValidUrl(url)) {
             data.contactFormUrl = url;
+            // 問い合わせフォームURLからルートURL（HPのURL）を抽出
+            try {
+              const contactUrlObj = new URL(url);
+              const rootUrl = `${contactUrlObj.protocol}//${contactUrlObj.host}`;
+              if (isValidUrl(rootUrl)) {
+                data.companyUrl = rootUrl;
+              }
+            } catch {
+              // URL解析エラー時はスキップ
+            }
           }
         }
+      }
+    }
+    
+    // HPのURLがまだ取得できていない場合、現在のページURLからルートURLを抽出
+    if (!data.companyUrl) {
+      try {
+        const currentUrl = page.url();
+        const currentUrlObj = new URL(currentUrl);
+        const rootUrl = `${currentUrlObj.protocol}//${currentUrlObj.host}`;
+        if (isValidUrl(rootUrl)) {
+          data.companyUrl = rootUrl;
+        }
+      } catch {
+        // URL解析エラー時はスキップ
       }
     }
 
@@ -1740,26 +1948,51 @@ async function scrapeFromMynavi(
     });
     await sleep(Math.max(SLEEP_MS * 2, MIN_SLEEP_MS_LONG * 2)); // ページ読み込みを待つ
 
-    // 広告を閉じる（右上の×ボタンなど）
+    // ポップアップ・広告を閉じる（強化版）
     try {
-      const closeAdButtons = await page.$$('button:has-text("×"), button[aria-label*="閉じる"], .close, [class*="close"], button.close, [class*="ad-close"]');
-      for (const closeBtn of closeAdButtons) {
+      // モーダル、オーバーレイ、ポップアップを閉じる
+      const popupSelectors = [
+        'button:has-text("×")',
+        'button[aria-label*="閉じる"]',
+        'button[aria-label*="close"]',
+        '.close',
+        '[class*="close"]',
+        'button.close',
+        '[class*="ad-close"]',
+        '[class*="modal-close"]',
+        '[class*="popup-close"]',
+        '[class*="overlay-close"]',
+        'button[class*="close"]',
+        '[id*="close"]',
+        '[data-dismiss="modal"]',
+        '[data-close]'
+      ];
+      
+      for (const selector of popupSelectors) {
         try {
-          const isVisible = await closeBtn.isVisible();
-          if (isVisible) {
-            await closeBtn.click();
-            await sleep(Math.max(SLEEP_MS, FAST_MODE ? 200 : 300));
+          await page.waitForSelector(selector, { timeout: 2000, state: 'visible' }).catch(() => {});
+          const closeButtons = await page.$$(selector);
+          for (const closeBtn of closeButtons) {
+            try {
+              const isVisible = await closeBtn.isVisible();
+              if (isVisible) {
+                await closeBtn.click({ timeout: 3000, force: true }).catch(() => {});
+                await sleep(Math.max(SLEEP_MS, FAST_MODE ? 200 : 300));
+              }
+            } catch {
+              // 個別のボタンクリックエラーは無視
+            }
           }
         } catch {
-          // 広告が存在しない場合はスキップ
+          // セレクターが見つからない場合はスキップ
         }
       }
     } catch {
       // 広告閉じ処理のエラーは無視
     }
 
-    // 検索テキストボックスを探す（複数のセレクターを試行）
-    let searchInput = null;
+    // 検索テキストボックスを探す（waitForSelectorで待機）
+    let searchInput: ElementHandle | null = null;
     const searchSelectors = [
       'input[placeholder*="企業名"]',
       'input[placeholder*="企業名で検索"]',
@@ -1772,6 +2005,8 @@ async function scrapeFromMynavi(
     
     for (const selector of searchSelectors) {
       try {
+        // 要素が表示されるまで待機
+        await page.waitForSelector(selector, { timeout: 5000, state: 'visible' }).catch(() => {});
         searchInput = await page.$(selector);
         if (searchInput) {
           const isVisible = await searchInput.isVisible();
@@ -1923,26 +2158,51 @@ async function scrapeFromMynavi2026(
     });
     await sleep(Math.max(SLEEP_MS * 3, MIN_SLEEP_MS_LONG * 2)); // ページ読み込みを待つ
 
-    // 広告を閉じる（右上の×ボタンなど）
+    // ポップアップ・広告を閉じる（強化版）
     try {
-      const closeAdButtons = await page.$$('button:has-text("×"), button[aria-label*="閉じる"], .close, [class*="close"], button.close, [class*="ad-close"]');
-      for (const closeBtn of closeAdButtons) {
+      // モーダル、オーバーレイ、ポップアップを閉じる
+      const popupSelectors = [
+        'button:has-text("×")',
+        'button[aria-label*="閉じる"]',
+        'button[aria-label*="close"]',
+        '.close',
+        '[class*="close"]',
+        'button.close',
+        '[class*="ad-close"]',
+        '[class*="modal-close"]',
+        '[class*="popup-close"]',
+        '[class*="overlay-close"]',
+        'button[class*="close"]',
+        '[id*="close"]',
+        '[data-dismiss="modal"]',
+        '[data-close]'
+      ];
+      
+      for (const selector of popupSelectors) {
         try {
-          const isVisible = await closeBtn.isVisible();
-          if (isVisible) {
-            await closeBtn.click();
-            await sleep(Math.max(SLEEP_MS, FAST_MODE ? 200 : 300));
+          await page.waitForSelector(selector, { timeout: 2000, state: 'visible' }).catch(() => {});
+          const closeButtons = await page.$$(selector);
+          for (const closeBtn of closeButtons) {
+            try {
+              const isVisible = await closeBtn.isVisible();
+              if (isVisible) {
+                await closeBtn.click({ timeout: 3000 }).catch(() => {});
+                await sleep(Math.max(SLEEP_MS, FAST_MODE ? 200 : 300));
+              }
+            } catch {
+              // 個別のボタンクリックエラーは無視
+            }
           }
         } catch {
-          // 広告が存在しない場合はスキップ
+          // セレクターが見つからない場合はスキップ
         }
       }
     } catch {
       // 広告閉じ処理のエラーは無視
     }
 
-    // 検索テキストボックスを探す（複数のセレクターを試行）
-    let searchInput = null;
+    // 検索テキストボックスを探す（waitForSelectorで待機）
+    let searchInput: ElementHandle | null = null;
     const searchSelectors = [
       'input[placeholder*="企業名"]',
       'input[placeholder*="キーワード"]',
@@ -1955,6 +2215,8 @@ async function scrapeFromMynavi2026(
     
     for (const selector of searchSelectors) {
       try {
+        // 要素が表示されるまで待機
+        await page.waitForSelector(selector, { timeout: 5000, state: 'visible' }).catch(() => {});
         searchInput = await page.$(selector);
         if (searchInput) {
           const isVisible = await searchInput.isVisible();
@@ -1968,14 +2230,27 @@ async function scrapeFromMynavi2026(
     }
 
     if (searchInput) {
-      await searchInput.fill(companyName);
+      // ポップアップ/広告で入力が阻害されることがあるため、forceクリック→入力
+      await searchInput.click({ force: true, timeout: 3000 }).catch(() => {});
+      try {
+        await searchInput.fill(companyName);
+      } catch {
+        // fillが失敗する場合はキーボード入力にフォールバック
+        await page.keyboard.type(companyName, { delay: 10 }).catch(() => {});
+      }
       await sleep(Math.max(SLEEP_MS, MIN_SLEEP_MS)); // 最小待機時間（高速化モード対応）
     } else {
       writeLog(`  [マイナビ2026] 検索ボックスが見つかりません: ${companyName}`);
       return data;
     }
 
-    // 「検索」ボタンを押下
+    // 「検索」ボタンを押下（waitForSelectorで待機）
+    try {
+      await page.waitForSelector('button:has-text("検索"), button[type="submit"]', { timeout: 5000, state: 'visible' }).catch(() => {});
+    } catch {
+      // ボタンが見つからない場合は続行
+    }
+    
     const searchButton = await page.$('button:has-text("検索"), button[type="submit"]');
     if (searchButton) {
       const isDisabled = await searchButton.isDisabled();
@@ -1983,8 +2258,11 @@ async function scrapeFromMynavi2026(
         writeLog(`  [マイナビ2026] 検索ボタンが無効のため取得不可: ${companyName}`);
         return data;
       }
-      await searchButton.click();
-      await page.waitForNavigation({ waitUntil: PAGE_WAIT_MODE, timeout: NAVIGATION_TIMEOUT }).catch(() => {});
+      // クリックと同時に遷移するため、Promise.allで待機（遷移取りこぼし防止）
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: PAGE_WAIT_MODE, timeout: NAVIGATION_TIMEOUT }).catch(() => {}),
+        searchButton.click({ force: true }).catch(() => {}),
+      ]);
       await sleep(Math.max(SLEEP_MS, MIN_SLEEP_MS_LONG)); // 最小待機時間（高速化モード対応）
     }
 
@@ -1995,16 +2273,20 @@ async function scrapeFromMynavi2026(
       for (const link of companyLinks) {
         const linkText = await link.textContent();
         if (linkText && linkText.trim().includes(companyName)) {
-          await link.click();
-          await page.waitForNavigation({ waitUntil: PAGE_WAIT_MODE, timeout: NAVIGATION_TIMEOUT }).catch(() => {});
+          await Promise.all([
+            page.waitForNavigation({ waitUntil: PAGE_WAIT_MODE, timeout: NAVIGATION_TIMEOUT }).catch(() => {}),
+            link.click({ force: true }).catch(() => {}),
+          ]);
           await sleep(Math.max(SLEEP_MS, MIN_SLEEP_MS_LONG)); // 最小待機時間（高速化モード対応）
           foundLink = true;
           break;
         }
       }
       if (!foundLink && companyLinks.length > 0) {
-        await companyLinks[0].click();
-        await page.waitForNavigation({ waitUntil: PAGE_WAIT_MODE, timeout: NAVIGATION_TIMEOUT }).catch(() => {});
+        await Promise.all([
+          page.waitForNavigation({ waitUntil: PAGE_WAIT_MODE, timeout: NAVIGATION_TIMEOUT }).catch(() => {}),
+          companyLinks[0].click({ force: true }).catch(() => {}),
+        ]);
         await sleep(Math.max(SLEEP_MS, MIN_SLEEP_MS_LONG)); // 最小待機時間（高速化モード対応）
       }
     }
@@ -2090,34 +2372,49 @@ async function scrapeFromCareeritas(
       await sleep(Math.max(SLEEP_MS, MIN_SLEEP_MS)); // 最小待機時間（高速化モード対応）
     }
 
-    // 検索ボタンを押下
+    // 検索ボタンを押下（Promise.allでナビゲーション待機）
     const searchButton = await page.$('button:has-text("検索"), button[type="submit"]');
     if (searchButton) {
-      await searchButton.click();
-      await page.waitForNavigation({ waitUntil: PAGE_WAIT_MODE, timeout: NAVIGATION_TIMEOUT }).catch(() => {});
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: PAGE_WAIT_MODE, timeout: NAVIGATION_TIMEOUT }).catch(() => {}),
+        searchButton.click({ force: true }).catch(() => {})
+      ]);
       await sleep(Math.max(SLEEP_MS, MIN_SLEEP_MS_LONG)); // 最小待機時間（高速化モード対応）
     }
 
-    // 企業リストから企業名のリンクを探してクリック
+    // 企業リストから企業名のリンクを探してクリック（Promise.allでナビゲーション待機）
     const companyLinks = await page.$$('a:has-text("' + companyName + '"), a[href*="/company/"]');
     if (companyLinks.length > 0) {
       let foundLink = false;
       for (const link of companyLinks) {
-        const linkText = await link.textContent();
+        let linkText: string | null = null;
+        try {
+          linkText = await link.textContent();
+        } catch {
+          // SPA遷移等でコンテキストが破棄される場合があるためスキップ
+          continue;
+        }
         if (linkText && linkText.trim().includes(companyName)) {
-          await link.click();
-          await page.waitForNavigation({ waitUntil: PAGE_WAIT_MODE, timeout: NAVIGATION_TIMEOUT }).catch(() => {});
+          await Promise.all([
+            page.waitForNavigation({ waitUntil: PAGE_WAIT_MODE, timeout: NAVIGATION_TIMEOUT }).catch(() => {}),
+            link.click({ force: true }).catch(() => {})
+          ]);
           await sleep(Math.max(SLEEP_MS, MIN_SLEEP_MS_LONG)); // 最小待機時間（高速化モード対応）
           foundLink = true;
           break;
         }
       }
       if (!foundLink && companyLinks.length > 0) {
-        await companyLinks[0].click();
-        await page.waitForNavigation({ waitUntil: PAGE_WAIT_MODE, timeout: NAVIGATION_TIMEOUT }).catch(() => {});
+        await Promise.all([
+          page.waitForNavigation({ waitUntil: PAGE_WAIT_MODE, timeout: NAVIGATION_TIMEOUT }).catch(() => {}),
+          companyLinks[0].click({ force: true }).catch(() => {})
+        ]);
         await sleep(Math.max(SLEEP_MS, MIN_SLEEP_MS_LONG)); // 最小待機時間（高速化モード対応）
       }
     }
+
+    // 遷移直後はコンテキスト破棄が起きやすいので、ロード状態を待つ
+    await page.waitForLoadState(PAGE_WAIT_MODE, { timeout: NAVIGATION_TIMEOUT }).catch(() => {});
 
     const html = await page.content();
     const $ = cheerio.load(html);
@@ -2158,6 +2455,11 @@ async function scrapeFromCareeritas(
 
   } catch (error) {
     const errorMsg = (error as any)?.message || String(error);
+    // クリックと同時遷移で発生することがあるエラーは、警告のみでスキップ
+    if (errorMsg.includes("Execution context was destroyed")) {
+      writeLog(`  [Careeritas] 遷移中のコンテキスト破棄のためスキップ: ${companyName}`);
+      return {};
+    }
     // DNSエラーやネットワークエラーは警告のみ（処理は続行）
     if (errorMsg.includes("ERR_NAME_NOT_RESOLVED") || errorMsg.includes("net::")) {
       // サイトが存在しない場合は静かにスキップ
@@ -2707,7 +3009,7 @@ async function scrapeFromHoujin(
     }
 
     // 検索テキストボックスを探す（複数のセレクターを試行）
-    let searchInput = null;
+    let searchInput: ElementHandle | null = null;
     const searchSelectors = [
       'input[placeholder*="企業名"]',
       'input[placeholder*="法人番号"]',
@@ -3123,7 +3425,7 @@ async function scrapeFromAlarmbox(
     }
 
     // 検索テキストボックスを探す（複数のセレクターを試行）
-    let searchInput = null;
+    let searchInput: ElementHandle | null = null;
     const searchSelectors = [
       'input[aria-label*="法人番号または企業名"]',
       'input[aria-label*="企業名"]',
@@ -3178,7 +3480,7 @@ async function scrapeFromAlarmbox(
     }
 
     // 検索ボタンを押下（虫眼鏡マークの検索ボタンを優先）
-    let searchButton = null;
+    let searchButton: ElementHandle | null = null;
     const buttonSelectors = [
       'button:has(svg[class*="search"])', // 虫眼鏡マークの検索ボタンを優先
       'button:has(svg[aria-label*="検索"])',
@@ -3255,7 +3557,7 @@ async function scrapeFromAlarmbox(
             // 住所情報がある場合は照合
             if (hasAddressInfo) {
               // リンクの親要素から住所情報を取得
-              const parentElement = await link.evaluateHandle((el: Element) => {
+              const parentElement = await link.evaluateHandle((el: any) => {
                 // 親要素を探す（div, li, tr, td, article, sectionなど）
                 let parent = el.parentElement;
                 let depth = 0;
@@ -3557,33 +3859,58 @@ async function scrapeFromUlletKeishin(
       return data;
     }
 
-    // 経審の検索ページにアクセス
-    await page.goto("https://keishin.ullet.com/", {
+    // 経審の検索ページにアクセス（正しいURLに修正）
+    await page.goto("https://ullet.com/keishin/", {
       waitUntil: PAGE_WAIT_MODE,
       timeout: PAGE_TIMEOUT,
     });
     await sleep(Math.max(SLEEP_MS * 2, MIN_SLEEP_MS_LONG * 2)); // ページ読み込みを待つ
 
-    // 広告を閉じる（右上の×ボタンなど）
+    // ポップアップ・広告を閉じる（強化版）
     try {
-      const closeAdButtons = await page.$$('button:has-text("×"), button[aria-label*="閉じる"], .close, [class*="close"], button.close, [class*="ad-close"], [class*="modal-close"]');
-      for (const closeBtn of closeAdButtons) {
+      // モーダル、オーバーレイ、ポップアップを閉じる
+      const popupSelectors = [
+        'button:has-text("×")',
+        'button[aria-label*="閉じる"]',
+        'button[aria-label*="close"]',
+        '.close',
+        '[class*="close"]',
+        'button.close',
+        '[class*="ad-close"]',
+        '[class*="modal-close"]',
+        '[class*="popup-close"]',
+        '[class*="overlay-close"]',
+        'button[class*="close"]',
+        '[id*="close"]',
+        '[data-dismiss="modal"]',
+        '[data-close]'
+      ];
+      
+      for (const selector of popupSelectors) {
         try {
-          const isVisible = await closeBtn.isVisible();
-          if (isVisible) {
-            await closeBtn.click();
-            await sleep(Math.max(SLEEP_MS, FAST_MODE ? 200 : 300));
+          await page.waitForSelector(selector, { timeout: 2000, state: 'visible' }).catch(() => {});
+          const closeButtons = await page.$$(selector);
+          for (const closeBtn of closeButtons) {
+            try {
+              const isVisible = await closeBtn.isVisible();
+              if (isVisible) {
+                await closeBtn.click({ timeout: 3000 }).catch(() => {});
+                await sleep(Math.max(SLEEP_MS, FAST_MODE ? 200 : 300));
+              }
+            } catch {
+              // 個別のボタンクリックエラーは無視
+            }
           }
         } catch {
-          // 広告が存在しない場合はスキップ
+          // セレクターが見つからない場合はスキップ
         }
       }
     } catch {
       // 広告閉じ処理のエラーは無視
     }
 
-    // 検索テキストボックスを探す（複数のセレクターを試行）
-    let searchInput = null;
+    // 検索テキストボックスを探す（waitForSelectorで待機）
+    let searchInput: ElementHandle | null = null;
     const searchSelectors = [
       'input[placeholder*="企業名"]',
       'input[placeholder*="許可番号"]',
@@ -3600,6 +3927,8 @@ async function scrapeFromUlletKeishin(
     
     for (const selector of searchSelectors) {
       try {
+        // 要素が表示されるまで待機
+        await page.waitForSelector(selector, { timeout: 5000, state: 'visible' }).catch(() => {});
         const elements = await page.$$(selector);
         for (const element of elements) {
           const isVisible = await element.isVisible();
@@ -3634,8 +3963,8 @@ async function scrapeFromUlletKeishin(
       return data;
     }
 
-    // 「検索」ボタンを押下
-    let searchButton = null;
+    // 「検索」ボタンを押下（waitForSelectorで待機）
+    let searchButton: ElementHandle | null = null;
     const buttonSelectors = [
       'button:has-text("検索")',
       'button[type="submit"]',
@@ -3644,6 +3973,13 @@ async function scrapeFromUlletKeishin(
       'form button[type="submit"]',
       'input[type="submit"]'
     ];
+    
+    // 検索ボタンが表示されるまで待機
+    try {
+      await page.waitForSelector('button:has-text("検索"), button[type="submit"]', { timeout: 5000, state: 'visible' }).catch(() => {});
+    } catch {
+      // ボタンが見つからない場合は続行
+    }
     
     for (const selector of buttonSelectors) {
       try {
@@ -4020,7 +4356,7 @@ async function scrapeFromUsonarYellowpage(
     }
 
     // 検索テキストボックスを探す（複数のセレクターを試行）
-    let searchInput = null;
+    let searchInput: ElementHandle | null = null;
     const searchSelectors = [
       'input[placeholder*="会社名、役員名"]',
       'input[placeholder*="企業名"]',
@@ -4822,7 +5158,99 @@ async function collectCompanyData(
 }
 
 /**
- * データをFirestoreに保存
+ * データをCloudSQLに保存
+ */
+async function saveToCloudSQL(
+  companyId: string,
+  updates: { [key: string]: any }
+): Promise<void> {
+  if (!pgPool) {
+    return;
+  }
+
+  try {
+    // フィールド名をスネークケースに変換するマッピング
+    const fieldMapping: { [key: string]: string } = {
+      companyUrl: "company_url",
+      contactFormUrl: "contact_form_url",
+      phoneNumber: "phone_number",
+      contactPhoneNumber: "contact_phone_number",
+      representativeName: "representative_name",
+      representativeKana: "representative_kana",
+      representativeTitle: "representative_title",
+      representativeBirthDate: "representative_birth_date",
+      representativePhone: "representative_phone",
+      representativePostalCode: "representative_postal_code",
+      representativeHomeAddress: "representative_home_address",
+      representativeRegisteredAddress: "representative_registered_address",
+      representativeAlmaMater: "representative_alma_mater",
+      industryLarge: "industry_large",
+      industryMiddle: "industry_middle",
+      industrySmall: "industry_small",
+      industryDetail: "industry_detail",
+      capitalStock: "capital_stock",
+      revenue: "revenue",
+      operatingIncome: "operating_income",
+      totalAssets: "total_assets",
+      totalLiabilities: "total_liabilities",
+      netAssets: "net_assets",
+      employeeCount: "employee_count",
+      factoryCount: "factory_count",
+      officeCount: "office_count",
+      storeCount: "store_count",
+      headquartersAddress: "headquarters_address",
+    };
+
+    // 更新用のSQLを構築
+    const setClauses: string[] = [];
+    const values: any[] = [];
+    let paramIndex = 1;
+
+    for (const [fieldName, fieldValue] of Object.entries(updates)) {
+      const dbFieldName = fieldMapping[fieldName] || fieldName;
+      
+      // 配列フィールドの処理
+      if (Array.isArray(fieldValue)) {
+        setClauses.push(`${dbFieldName} = $${paramIndex}`);
+        values.push(fieldValue);
+        paramIndex++;
+      }
+      // JSONBフィールドの処理
+      else if (typeof fieldValue === "object" && fieldValue !== null) {
+        setClauses.push(`${dbFieldName} = $${paramIndex}`);
+        values.push(JSON.stringify(fieldValue));
+        paramIndex++;
+      }
+      // 通常の値
+      else {
+        setClauses.push(`${dbFieldName} = $${paramIndex}`);
+        values.push(fieldValue);
+        paramIndex++;
+      }
+    }
+
+    if (setClauses.length === 0) {
+      return;
+    }
+
+    // UPDATE文を実行
+    const updateQuery = `
+      UPDATE companies 
+      SET ${setClauses.join(", ")}, updated_at = NOW()
+      WHERE id = $${paramIndex}
+    `;
+    values.push(companyId);
+
+    await pgPool.query(updateQuery, values);
+    writeLog(`  ✅ [${companyId}] CloudSQL保存完了: ${setClauses.length} フィールド`);
+  } catch (error) {
+    writeLog(`  ❌ [${companyId}] CloudSQL保存エラー: ${error instanceof Error ? error.message : String(error)}`);
+    throw error;
+  }
+}
+
+/**
+ * データをCloudSQLに保存
  */
 async function saveToFirestore(
   companyId: string,
@@ -4834,6 +5262,9 @@ async function saveToFirestore(
   let errorMessage: string | undefined;
 
   try {
+    // 保存直前のURL/住所クリーニング（最優先）
+    scrapedData = sanitizeScrapedDataForSave(scrapedData);
+
     const updates: { [key: string]: any } = {};
 
     // フィールドマッピング（検証付き）
@@ -4854,6 +5285,14 @@ async function saveToFirestore(
       writeLog(`  ⚠️  [${companyId}] 不正なFAXをスキップ: ${scrapedData.fax}`);
     }
     
+    if (scrapedData.companyUrl && isValidUrl(scrapedData.companyUrl)) {
+      updates.companyUrl = scrapedData.companyUrl;
+      updatedFields.push("companyUrl");
+      writeLog(`  ✅ [${companyId}] HPのURL取得: ${scrapedData.companyUrl}`);
+    } else if (scrapedData.companyUrl) {
+      writeLog(`  ⚠️  [${companyId}] 不正なHPのURLをスキップ: ${scrapedData.companyUrl}`);
+    }
+    
     if (scrapedData.contactFormUrl && isValidUrl(scrapedData.contactFormUrl)) {
       updates.contactFormUrl = scrapedData.contactFormUrl;
       updatedFields.push("contactFormUrl");
@@ -4871,9 +5310,21 @@ async function saveToFirestore(
     }
     if (scrapedData.sns && scrapedData.sns.length > 0) {
       // SNSをURLsフィールドに追加
-      const existingUrls = (await db.collection("companies_new").doc(companyId).get()).data()?.urls || [];
-      updates.urls = [...new Set([...existingUrls, ...scrapedData.sns])];
-      updatedFields.push("urls");
+      if (pgPool) {
+        try {
+          const result = await pgPool.query('SELECT urls FROM companies WHERE id = $1', [companyId]);
+          const existingUrls = result.rows[0]?.urls || [];
+          updates.urls = [...new Set([...existingUrls, ...scrapedData.sns])];
+          updatedFields.push("urls");
+        } catch (error) {
+          // エラー時は新しいSNSのみを保存
+          updates.urls = scrapedData.sns;
+          updatedFields.push("urls");
+        }
+      } else {
+        updates.urls = scrapedData.sns;
+        updatedFields.push("urls");
+      }
     }
     if (scrapedData.executives && scrapedData.executives.length > 0) {
       updates.executives = scrapedData.executives;
@@ -5104,20 +5555,12 @@ async function saveToFirestore(
     }
 
     if (Object.keys(updates).length > 0) {
-      // データが実際に取得・保存された場合のみ、スクレイピング処理済みフラグを設定
-      updates.extendedFieldsScrapedAt = admin.firestore.FieldValue.serverTimestamp();
-      updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
-      
       // 保存前のログ出力（保存される値の詳細を記録）
-      writeLog(`  💾 [${companyId}] Firestore保存開始: ${Object.keys(updates).length} フィールド`);
+      writeLog(`  💾 [${companyId}] CloudSQL保存開始: ${Object.keys(updates).length} フィールド`);
       writeLog(`  📝 [${companyId}] 保存されるフィールドと値:`);
       
-      // タイムスタンプフィールドを除いた実際のデータをログに出力
-      const dataUpdates = { ...updates };
-      delete dataUpdates.extendedFieldsScrapedAt;
-      delete dataUpdates.updatedAt;
-      
-      for (const [fieldName, fieldValue] of Object.entries(dataUpdates)) {
+      // データをログに出力
+      for (const [fieldName, fieldValue] of Object.entries(updates)) {
         let logValue: string;
         if (Array.isArray(fieldValue)) {
           // 配列の場合は、全要素を表示（最大20件）
@@ -5135,47 +5578,26 @@ async function saveToFirestore(
         writeLog(`    - ${fieldName}: ${logValue}`);
       }
       
-      await db.collection("companies_new").doc(companyId).update(updates);
-      status = "success";
-      
-      // 保存後の確認（実際に保存された値を取得してログに出力）
-      try {
-        const savedDoc = await db.collection("companies_new").doc(companyId).get();
-        const savedData = savedDoc.data();
-        if (savedData) {
-          writeLog(`  ✅ [${companyId}] Firestore保存完了: ${Object.keys(dataUpdates).length} フィールド`);
-          writeLog(`  📋 [${companyId}] Firestore保存後の確認（保存されたフィールドと値）:`);
-          for (const fieldName of updatedFields) {
-            const savedValue = savedData[fieldName];
-            if (savedValue !== null && savedValue !== undefined) {
-              let logValue: string;
-              if (Array.isArray(savedValue)) {
-                const displayItems = savedValue.slice(0, 20);
-                logValue = `[${savedValue.length}件] ${displayItems.join(", ")}${savedValue.length > 20 ? "..." : ""}`;
-              } else if (typeof savedValue === "string" && savedValue.length > 200) {
-                logValue = `${savedValue.substring(0, 200)}... (長さ: ${savedValue.length}文字)`;
-              } else if (typeof savedValue === "number") {
-                logValue = savedValue.toLocaleString();
-              } else if (savedValue && typeof savedValue === "object" && "toDate" in savedValue) {
-                // Timestamp オブジェクトの場合
-                logValue = savedValue.toDate().toISOString();
-              } else {
-                logValue = String(savedValue);
-              }
-              writeLog(`    ✓ ${fieldName}: ${logValue}`);
-            }
-          }
-          writeLog(`  ✅ [${companyId}] 保存フィールド一覧: ${updatedFields.join(", ")} - 処理済みフラグ設定`);
+      // CloudSQLに保存
+      if (pgPool) {
+        try {
+          await saveToCloudSQL(companyId, updates);
+          status = "success";
+          writeLog(`  ✅ [${companyId}] CloudSQL保存完了: ${Object.keys(updates).length} フィールド (${updatedFields.join(", ")})`);
+        } catch (error) {
+          status = "failed";
+          errorMessage = error instanceof Error ? error.message : String(error);
+          writeLog(`  ❌ [${companyId}] CloudSQL保存エラー: ${errorMessage}`);
         }
-      } catch (verifyError) {
-        // 確認ログのエラーは無視して続行
-        writeLog(`  ✅ [${companyId}] Firestore保存完了: ${Object.keys(dataUpdates).length} フィールド (${updatedFields.join(", ")}) - 処理済みフラグ設定`);
-        writeLog(`  ⚠️  [${companyId}] 保存確認時のエラー: ${(verifyError as any)?.message}`);
+      } else {
+        status = "failed";
+        errorMessage = "CloudSQL接続が初期化されていません";
+        writeLog(`  ❌ [${companyId}] ${errorMessage}`);
       }
     } else {
       // データが取得できなかった場合はフラグを設定しない（次回も処理対象になる）
       status = "no_data";
-      writeLog(`  ⚠️  [${companyId}] Firestoreに保存するデータがありません（スクレイピングで取得できたデータも保存対象外でした） - 処理済みフラグは設定しません`);
+      writeLog(`  ⚠️  [${companyId}] 保存するデータがありません（スクレイピングで取得できたデータも保存対象外でした）`);
     }
 
   } catch (error) {
@@ -5253,6 +5675,109 @@ function isAlreadyScraped(companyData: any): boolean {
 }
 
 /**
+ * CloudSQLから企業情報を取得
+ */
+function snakeToCamelKey(key: string): string {
+  return key.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
+}
+
+function normalizeCloudSqlRowToCamelCase<T extends Record<string, any>>(row: T): any {
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(row)) {
+    out[snakeToCamelKey(k)] = v;
+  }
+  return out;
+}
+
+async function getCompaniesFromCloudSQL(
+  limit?: number,
+  offset?: number
+): Promise<Array<{ id: string; name: string; corporateNumber: string | null }>> {
+  if (!pgPool) {
+    throw new Error("PostgreSQL接続が初期化されていません");
+  }
+
+  try {
+    // まずデータベースが存在するか確認し、存在しない場合はpostgresデータベースを使用
+    let query = `
+      SELECT id, name, corporate_number as "corporateNumber"
+      FROM companies
+      WHERE name IS NOT NULL AND name != ''
+        AND (
+          company_url IS NULL OR company_url = '' OR
+          headquarters_address IS NULL OR headquarters_address = '' OR
+          address IS NULL OR address = ''
+        )
+      ORDER BY id
+    `;
+    
+    const params: any[] = [];
+    if (limit) {
+      query += ` LIMIT $${params.length + 1}`;
+      params.push(limit);
+    }
+    if (offset) {
+      query += ` OFFSET $${params.length + 1}`;
+      params.push(offset);
+    }
+
+    const result = await pgPool.query(query, params);
+    return result.rows;
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    writeLog(`  ❌ CloudSQLから企業取得エラー: ${errorMessage}`);
+    
+    // データベースが存在しないエラーの場合、ヒントを表示
+    if (errorMessage.includes("does not exist") && errorMessage.includes("database")) {
+      writeLog(`  💡 ヒント: データベースが存在しない可能性があります。`);
+      writeLog(`     環境変数 POSTGRES_DB を確認するか、デフォルトの "postgres" データベースを使用してください。`);
+    }
+    
+    throw error;
+  }
+}
+
+/**
+ * CloudSQLから企業名と法人番号で企業情報を取得
+ */
+async function getCompanyFromCloudSQLByNameAndCorporateNumber(
+  name: string,
+  corporateNumber: string | null
+): Promise<any | null> {
+  if (!pgPool) {
+    throw new Error("PostgreSQL接続が初期化されていません");
+  }
+
+  try {
+    let query = `
+      SELECT *
+      FROM companies
+      WHERE name = $1
+    `;
+    const params: any[] = [name];
+
+    if (corporateNumber) {
+      query += ` AND corporate_number = $2`;
+      params.push(corporateNumber);
+    } else {
+      query += ` AND (corporate_number IS NULL OR corporate_number = '')`;
+    }
+
+    query += ` LIMIT 1`;
+
+    const result = await pgPool.query(query, params);
+    if (result.rows.length === 0) {
+      return null;
+    }
+    // CloudSQLのsnake_caseカラムをcamelCaseに正規化して、以降の処理（getNullFields等）と整合させる
+    return normalizeCloudSqlRowToCamelCase(result.rows[0]);
+  } catch (error) {
+    writeLog(`  ❌ CloudSQLから企業取得エラー (${name}, ${corporateNumber}): ${error instanceof Error ? error.message : String(error)}`);
+    throw error;
+  }
+}
+
+/**
  * メイン処理: 全企業の情報を収集（未処理の企業のみ）
  */
 async function main() {
@@ -5261,7 +5786,7 @@ async function main() {
   try {
     writeLog("=".repeat(80));
     writeLog("Webスクレイピングを開始...");
-    writeLog(`（既に処理済みの企業はスキップします）`);
+    writeLog(`（CloudSQLから企業情報を取得して処理します）`);
     writeLog(`ログファイル: ${logFilePath}`);
     writeLog(`CSVファイル: ${csvFilePath}`);
     writeLog(`速度設定: SLEEP_MS=${SLEEP_MS}ms, PAGE_WAIT_MODE=${PAGE_WAIT_MODE}, PAGE_TIMEOUT=${PAGE_TIMEOUT}ms, NAVIGATION_TIMEOUT=${NAVIGATION_TIMEOUT}ms`);
@@ -5289,6 +5814,14 @@ async function main() {
     writeLog("=".repeat(80));
     console.log("");
 
+    // CloudSQL接続を初期化
+    pgPool = initPostgres();
+    
+    if (!pgPool) {
+      writeLog("❌ CloudSQL接続が初期化できませんでした。環境変数を確認してください。");
+      process.exit(1);
+    }
+
     // ブラウザを起動（メインブラウザ - ログインが必要なサイト用）
     browser = await chromium.launch({ headless: true });
     const loginPage = await browser.newPage();
@@ -5308,16 +5841,112 @@ async function main() {
 
     await loginPage.close();
 
-    // null_fields_detailed配下のCSVファイルを読み込む
-    writeLog("\nnull_fields_detailed配下のCSVファイルを読み込み中...");
-    const nullFieldsMap = await loadNullFieldsFromCsv();
+    // CloudSQLから企業を取得して処理
+    writeLog("\nCloudSQLから企業を取得中...");
     
     let totalProcessed = 0;
     let totalSkipped = 0;
     let totalUpdated = 0;
-
-    // CSVから読み込んだ企業リストを使用する場合
-    if (nullFieldsMap.size > 0) {
+    
+    // CloudSQLから企業を取得（企業名と法人番号がある企業のみ）
+    const BATCH_SIZE = 100;
+    let offset = 0;
+    let hasMore = true;
+    
+    while (hasMore) {
+      const companies = await getCompaniesFromCloudSQL(BATCH_SIZE, offset);
+      
+      if (companies.length === 0) {
+        hasMore = false;
+        break;
+      }
+      
+      writeLog(`\n処理中: ${offset + 1}〜${offset + companies.length}件目（合計 ${companies.length}件）`);
+      
+      // 各企業を処理
+      for (const company of companies) {
+        const companyId = company.id;
+        const companyName = company.name || "";
+        const corporateNumber = company.corporateNumber || null;
+        
+        try {
+          // CloudSQLから企業情報を再取得（企業名+法人番号で特定）
+          const companyData = await getCompanyFromCloudSQLByNameAndCorporateNumber(companyName, corporateNumber);
+          
+          if (!companyData) {
+            writeLog(`  ⚠️  [${companyId}] 企業が見つかりません: ${companyName} / ${corporateNumber}`);
+            totalSkipped++;
+            continue;
+          }
+          
+          // 既に処理済みの場合はスキップ
+          if (isAlreadyScraped(companyData)) {
+            totalSkipped++;
+            continue;
+          }
+          
+          // スクレイピングで情報を取得
+          const scrapedData = await collectCompanyData(browser, companyId, companyData, undefined);
+          
+          // CloudSQLに保存
+          const saveResult = await saveToFirestore(companyId, companyName, scrapedData);
+          
+          // CSVに記録
+          writeCsvRow({
+            companyId,
+            companyName,
+            scrapedFields: saveResult.updatedFields,
+            status: saveResult.status,
+            errorMessage: saveResult.errorMessage,
+          });
+          
+          if (saveResult.status === "success") {
+            totalUpdated++;
+          }
+          
+          totalProcessed++;
+          await sleep(SLEEP_MS);
+          
+          // LIMITが設定されている場合、成功数がLIMITに達したら終了
+          if (LIMIT && totalUpdated >= LIMIT) {
+            writeLog(`  ✅ 成功カウント制限に達しました（${totalUpdated}件）。処理を終了します。`);
+            hasMore = false;
+            break;
+          }
+          
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          writeLog(`  ❌ [${companyId}] 処理エラー: ${errorMessage}`);
+          writeCsvRow({
+            companyId,
+            companyName,
+            scrapedFields: [],
+            status: "failed",
+            errorMessage,
+          });
+          totalProcessed++;
+          
+          if (SKIP_ON_ERROR) {
+            continue;
+          } else {
+            throw error;
+          }
+        }
+      }
+      
+      // 次のバッチに進む
+      offset += companies.length;
+      
+      // レート制限対策
+      await sleep(SLEEP_MS * 2);
+      
+      // 進捗を表示
+      writeLog(`  進捗: 処理済み ${totalProcessed} 件 / スキップ ${totalSkipped} 件 / 更新 ${totalUpdated} 件`);
+    }
+    
+    // CSVファイルから読み込む場合はスキップ
+    const nullFieldsMap = await loadNullFieldsFromCsv();
+    if (nullFieldsMap.size > 0 && false) {
       let companyIds = Array.from(nullFieldsMap.keys());
       
       // 逆順実行オプション（環境変数 REVERSE_ORDER=true で有効化）
@@ -5348,19 +5977,20 @@ async function main() {
       }
       
       // 開始位置が指定されている場合
-      if (START_FROM_ID) {
+      if (START_FROM_ID !== null && START_FROM_ID !== undefined) {
+        const startId: string = START_FROM_ID as string; // 型アサーション
         if (REVERSE_ORDER) {
           // 逆順の場合は、指定ID以下の最大のIDから開始
-          const startIndex = companyIds.findIndex(id => id <= START_FROM_ID);
+          const startIndex = companyIds.findIndex((id: string) => id <= startId);
           if (startIndex >= 0) {
-            writeLog(`指定された企業IDから開始（逆順）: ${START_FROM_ID} (${startIndex + 1}件目)`);
+            writeLog(`指定された企業IDから開始（逆順）: ${startId} (${startIndex + 1}件目)`);
             companyIds.splice(0, startIndex);
           }
         } else {
           // 通常順の場合は、指定ID以上の最小のIDから開始
-          const startIndex = companyIds.findIndex(id => id >= START_FROM_ID);
+          const startIndex = companyIds.findIndex((id: string) => id >= startId);
           if (startIndex >= 0) {
-            writeLog(`指定された企業IDから開始: ${START_FROM_ID} (${startIndex + 1}件目)`);
+            writeLog(`指定された企業IDから開始: ${startId} (${startIndex + 1}件目)`);
             companyIds.splice(0, startIndex);
           }
         }
@@ -5410,6 +6040,12 @@ async function main() {
             
             for (let chunkStart = 0; chunkStart < batch.length; chunkStart += MAX_GETALL_SIZE) {
               const chunk = batch.slice(chunkStart, chunkStart + MAX_GETALL_SIZE);
+              
+              if (!db) {
+                // Firestoreが初期化されていない場合はスキップ
+                continue;
+              }
+              
               const docRefs = chunk.map(companyId => db.collection("companies_new").doc(companyId));
               
               try {
@@ -5449,6 +6085,10 @@ async function main() {
                   const companyNullFields = nullFieldsMap.get(companyId)!;
                   
                   try {
+                    if (!db) {
+                      totalSkipped++;
+                      continue;
+                    }
                     const companyDoc = await db.collection("companies_new").doc(companyId).get();
                     
                     if (!companyDoc.exists) {
@@ -5513,7 +6153,11 @@ async function main() {
           const csvNullFields = companyNullFields.nullFields;
 
           try {
-            // Firestoreから企業データを取得
+            // Firestoreから企業データを取得（CSVファイルからの処理の場合のみ）
+            if (!db) {
+              totalSkipped++;
+              continue;
+            }
             const companyDoc = await db.collection("companies_new").doc(companyId).get();
             
             if (!companyDoc.exists) {
@@ -5607,6 +6251,13 @@ async function main() {
       await Promise.allSettled(workers);
     } else {
       // CSVがない場合は従来の方法（Firestoreから全企業を取得）
+      // 注意: CloudSQLのみ使用する場合、この処理はスキップされます
+      if (!db) {
+        writeLog("\n⚠️  Firestoreが初期化されていないため、CSVファイルなしの処理はスキップされます");
+        writeLog("CloudSQLからの直接取得のみがサポートされています");
+        return;
+      }
+      
       writeLog("\n従来の方法（Firestoreから全企業を取得）で処理を続行します...");
       
       const BATCH_SIZE = 50;
@@ -5730,6 +6381,11 @@ async function main() {
   } finally {
     if (browser) {
       await browser.close();
+    }
+    // PostgreSQL接続を閉じる
+    if (pgPool) {
+      await pgPool.end();
+      writeLog("[CloudSQL] PostgreSQL接続を閉じました");
     }
   }
 }

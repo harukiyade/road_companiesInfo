@@ -1,53 +1,41 @@
 {
-<<<<<<< HEAD
-  "dependencies": {
-    "@google/generative-ai": "^0.21.0",
-    "@grpc/proto-loader": "^0.8.0",
-    "cheerio": "^1.1.2",
-    "csv-parse": "^6.1.0",
-    "firebase-admin": "^13.6.0",
-    "next": "^16.0.3",
-    "node-fetch": "^3.3.2",
-    "playwright": "^1.57.0",
-    "react": "^19.2.0",
-    "react-dom": "^19.2.0",
-    "webidl-conversions": "^8.0.0",
-    "yauzl": "^3.2.0"
-  },
-  "devDependencies": {
-    "@types/node": "^24.10.1",
-    "@types/node-fetch": "^2.6.13",
-    "@types/react": "^19.2.5",
-    "@types/react-dom": "^19.2.3",
-    "@types/yauzl": "^2.10.3",
-    "ts-node": "^10.9.2",
-    "typescript": "^5.9.3"
-=======
   "scripts": {
     "import:companies": "ts-node scripts/import_companies_from_csv.ts ./csv"
   },
   "dependencies": {
     "@google/generative-ai": "^0.21.0",
+    "@grpc/proto-loader": "^0.8.0",
     "@types/cheerio": "^0.22.35",
     "@types/iconv-lite": "^0.0.1",
     "axios": "^1.13.2",
-    "cheerio": "^1.1.2",
+    "cheerio": "^1.2.0",
     "csv-parse": "^6.1.0",
     "csv-writer": "^1.6.0",
     "dotenv": "^17.2.3",
     "firebase-admin": "^13.6.0",
     "iconv-lite": "^0.7.1",
+    "next": "^16.0.3",
+    "node-fetch": "^3.3.2",
     "papaparse": "^5.4.1",
-    "playwright": "^1.48.0"
+    "pg": "^8.17.2",
+    "playwright": "^1.58.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "webidl-conversions": "^8.0.0",
+    "xml2js": "^0.6.2",
+    "yauzl": "^3.2.0"
   },
   "devDependencies": {
-    "@types/node": "^24.10.1",
+    "@types/node": "^24.10.9",
+    "@types/node-fetch": "^2.6.13",
     "@types/papaparse": "^5.5.1",
+    "@types/pg": "^8.16.0",
+    "@types/react": "^19.2.5",
+    "@types/react-dom": "^19.2.3",
     "@types/xml2js": "^0.4.14",
+    "@types/yauzl": "^2.10.3",
     "ts-node": "^10.9.2",
     "tsx": "^4.21.0",
-    "typescript": "^5.9.3",
-    "xml2js": "^0.6.2"
->>>>>>> b08347e46f27f01efa3b8926d61656398aecebee
+    "typescript": "^5.9.3"
   }
 }

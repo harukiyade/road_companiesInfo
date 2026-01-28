@@ -1,40 +1,25 @@
 {
   "compilerOptions": {
     "target": "ES2020",
-<<<<<<< HEAD
     "module": "commonjs",
     "lib": ["ES2020"],
-    "outDir": "./dist",
-    "rootDir": "./",
-    "strict": true,
-    "noImplicitAny": false,
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
-    "resolveJsonModule": true,
-    "moduleResolution": "node",
-    "types": ["node"]
-  },
-  "include": ["scripts/**/*"],
-  "exclude": ["node_modules", "frontend"]
-=======
-    "module": "CommonJS",
     "moduleResolution": "node",
     "esModuleInterop": true,
     "allowSyntheticDefaultImports": true,
     "strict": true,
+    "noImplicitAny": false,
     "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
     "outDir": "./dist",
-    "rootDir": "./scripts",
+    "rootDir": "./",
     "types": ["node"]
   },
   "include": ["scripts/**/*"],
+  "exclude": ["node_modules", "frontend"],
   "ts-node": {
     "compilerOptions": {
-      "module": "CommonJS"
+      "module": "commonjs"
     }
   }
->>>>>>> b08347e46f27f01efa3b8926d61656398aecebee
 }
-
