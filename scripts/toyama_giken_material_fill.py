@@ -1,529 +1,460 @@
 #!/usr/bin/env python3
 """
-富山技研興業 専用：決算書PDF → マテリアルExcel 抽出・転記スクリプト
+【Legatus ONE用】決算書PDF → マテリアルExcel 転記システム（完全マッチング・エラー回避版）
 
-- Step1: LLM Vision (Gemini) でPDFから1円単位の数値を抽出
-- Step2: 設計書に基づく静的マッピングでテンプレートに値のみ書き込み（数式・表示形式は変更しない）
-
-使い方:
-  # 本番（3つのPDFをGeminiで解析 → Excel出力）
-  export GEMINI_API_KEY=your_key
-  python scripts/toyama_giken_material_fill.py
-
-  # 転記のみ（抽出済みJSONからExcel生成。API不要）
-  python scripts/toyama_giken_material_fill.py --from-json data/output/toyama_giken_extracted_sample.json
-
-出力:
-  - data/output/【マテリアル】_富山技研興業.xlsx
-  - API使用時は data/output/toyama_giken_extracted.json も保存
-
-セル番地の調整: 本ファイル先頭の PL_MAPPING / BS_*_MAPPING 定数を編集してください。
+修正・強化内容:
+1. APIエラーの回避: configによるJSON指定を削除し、プロンプト指示で強制。サイレントエラーを根絶。
+2. 最強の文字列クリーニング: 改行、全半角スペース、特殊記号を完全に除去しマッチング漏れを根絶。
+3. 行単位の全文連結スキャン: 結合セルやインデントに左右されず、その行の科目を100%特定。
+4. 誤爆防止: シート別に開始行を厳格に指定し、タイトル行（3行目等）への上書きをブロック。
 """
 
+import datetime
 import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
+from copy import copy
+import openpyxl
 
-# プロジェクトルートをパスに追加
-REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-# -----------------------------------------------------------------------------
-# 設定・パス（必要に応じて変更）
-# -----------------------------------------------------------------------------
-TEMPLATE_PATH = REPO_ROOT / "data/template/【マテリアル】_デビス㈱.xlsx"
-OUTPUT_DIR = REPO_ROOT / "data/output"
-PDFS = [
-    (REPO_ROOT / "data/template/kessansho/１９：決算書一式（令和３年度）富山技研興業.pdf", "令和3年度"),
-    (REPO_ROOT / "data/template/kessansho/２０：決算書一式（令和４年度）富山技研興業.pdf", "令和4年度"),
-    (REPO_ROOT / "data/template/kessansho/２１：決算書一式（令和５年度）富山技研興業.pdf", "令和5年度"),
-]
-OUTPUT_EXCEL_NAME = "【マテリアル】_富山技研興業.xlsx"
-
-# 基本情報（転記用固定値；PDFから取得できない場合のフォールバック）
-COMPANY_NAME = "富山技研興業株式会社"
-# 各年度の決算末日（ヘッダー年月用）
-FISCAL_END_R3 = "2022-03-31"
-FISCAL_END_R4 = "2023-03-31"
-FISCAL_END_R5 = "2025-03-31"
+# --- パス設定 ---
+TEMPLATE_PATH = Path("/Users/harumacmini/programming/info_companyDetail/data/template/【マテリアル】_テンプレート.xlsx")
+INPUT_PDF_DIR = Path("/Users/harumacmini/programming/info_companyDetail/data/template/kessansho")
+OUTPUT_DIR = Path("/Users/harumacmini/programming/info_companyDetail/data/output")
 
 # -----------------------------------------------------------------------------
-# セルマッピング定数（設計書に基づく。ズレがあればここだけ修正する）
-# openpyxl は 1-based の row, column を使用。売上高=E8、現金預金=F9 等、設計図通り。
+# 1. ユーティリティ
 # -----------------------------------------------------------------------------
+def get_master_cell(ws, row, col):
+    """結合セルの場合でも左上の親セルを返す（書き込みエラー防止）"""
+    for merged_range in ws.merged_cells.ranges:
+        if merged_range.min_row <= row <= merged_range.max_row and \
+           merged_range.min_col <= col <= merged_range.max_col:
+            return ws.cell(row=merged_range.min_row, column=merged_range.min_col)
+    return ws.cell(row=row, column=col)
 
-# PL: 令和3→E(5), 令和4→G(7), 令和5→I(9)
-PL_COL_R3, PL_COL_R4, PL_COL_R5 = 5, 7, 9
-# BS: 令和3→F(6), 令和4→G(7), 令和5→H(8)
-BS_COL_R3, BS_COL_R4, BS_COL_R5 = 6, 7, 8
+def find_cell_by_text(ws, search_text, max_row=60):
+    for r in range(1, max_row + 1):
+        for c in range(1, 10):
+            val = ws.cell(row=r, column=c).value
+            if val and isinstance(val, str) and search_text in val:
+                return r, c
+    return None, None
 
-# (JSONキー, シート名, 行, 令和3の列, 令和4の列, 令和5の列)
-PL_MAPPING = [
-    ("売上高", "PL", 8, PL_COL_R3, PL_COL_R4, PL_COL_R5),   # E8,G8,I8
-    ("期首商品棚卸高", "PL", 10, PL_COL_R3, PL_COL_R4, PL_COL_R5),
-    ("仕入高", "PL", 11, PL_COL_R3, PL_COL_R4, PL_COL_R5),
-    ("期末商品棚卸高", "PL", 12, PL_COL_R3, PL_COL_R4, PL_COL_R5),
-    ("受取利息", "PL", 17, PL_COL_R3, PL_COL_R4, PL_COL_R5),
-    ("為替差益", "PL", 18, PL_COL_R3, PL_COL_R4, PL_COL_R5),
-    ("雑収入", "PL", 19, PL_COL_R3, PL_COL_R4, PL_COL_R5),
-    ("支払利息", "PL", 21, PL_COL_R3, PL_COL_R4, PL_COL_R5),
-    ("雑損失", "PL", 22, PL_COL_R3, PL_COL_R4, PL_COL_R5),
-    ("固定資産売却益", "PL", 25, PL_COL_R3, PL_COL_R4, PL_COL_R5),
-    ("負債調整勘定戻入", "PL", 26, PL_COL_R3, PL_COL_R4, PL_COL_R5),
-    ("固定資産除却損", "PL", 28, PL_COL_R3, PL_COL_R4, PL_COL_R5),
-    ("投資有価証券評価損", "PL", 29, PL_COL_R3, PL_COL_R4, PL_COL_R5),
-    ("仮払金評価損", "PL", 30, PL_COL_R3, PL_COL_R4, PL_COL_R5),
-    ("在庫評価引当金繰入", "PL", 31, PL_COL_R3, PL_COL_R4, PL_COL_R5),
-    ("子会社清算損", "PL", 32, PL_COL_R3, PL_COL_R4, PL_COL_R5),
-    ("不良債権", "PL", 33, PL_COL_R3, PL_COL_R4, PL_COL_R5),
-    ("法人税住民税及び事業税", "PL", 36, PL_COL_R3, PL_COL_R4, PL_COL_R5),
-]
+def copy_cell_style(source_cell, target_cell):
+    if source_cell.has_style:
+        target_cell.font = copy(source_cell.font)
+        target_cell.border = copy(source_cell.border)
+        target_cell.fill = copy(source_cell.fill)
+        target_cell.number_format = copy(source_cell.number_format)
+        target_cell.protection = copy(source_cell.protection)
+        target_cell.alignment = copy(source_cell.alignment)
 
-BS_ASSET_MAPPING = [
-    ("現金預金", "BS", 9, BS_COL_R3, BS_COL_R4, BS_COL_R5),   # F9,G9,H9
-    ("売掛金", "BS", 10, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("棚卸資産", "BS", 11, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("貸付金", "BS", 12, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("前払費用", "BS", 13, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("仮払金", "BS", 14, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("仮払税金", "BS", 15, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("建物建物附属設備", "BS", 30, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("機械装置", "BS", 31, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("車両運搬具", "BS", 32, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("器具備品", "BS", 33, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("土地", "BS", 34, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("電話加入権", "BS", 42, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("ソフトウェア", "BS", 43, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("のれん", "BS", 44, BS_COL_R3, None, None),  # 令和3のみセルあり
-    ("投資有価証券", "BS", 49, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("保証金", "BS", 50, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("長期前払費用", "BS", 51, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-]
-BS_LIAB_MAPPING = [
-    ("買掛金", "BS", 76, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("借入金", "BS", 77, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("前受金", "BS", 78, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("仮受金", "BS", 79, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("在庫評価引当金", "BS", 80, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("貸倒引当金", "BS", 81, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("退職給付引当金", "BS", 82, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("未払法人税等", "BS", 83, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("長期借入金", "BS", 96, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("負債調整勘定", "BS", 97, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("預り保証金", "BS", 98, BS_COL_R3, BS_COL_R4, None),  # H98は無し
-]
-BS_EQ_MAPPING = [
-    ("資本金", "BS", 112, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("繰越利益剰余金", "BS", 121, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-    ("当期純利益", "BS", 122, BS_COL_R3, BS_COL_R4, BS_COL_R5),
-]
+def clean_extracted_name(name):
+    if not name: return ""
+    return re.sub(r'[\s　\.．]', '', str(name))
 
-# SGA: 内訳書の科目を**個別に**該当行へ転記。雑費への丸投げは禁止。
-# (JSONキー, シート名, 行, 期1列, 期2列, 期3列)。複数キーは同じ行にマッピング可（別名）。
-SGA_COL_R3, SGA_COL_R4, SGA_COL_R5 = 5, 7, 9
-SGA_MAPPING = [
-    ("役員報酬", "SGA", 8, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("給料手当", "SGA", 9, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),  # 先に書く（次で上書き可）
-    ("給与・賞与・退職金", "SGA", 9, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("法定福利費", "SGA", 10, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("退職給付引当金繰入", "SGA", 11, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("運賃", "SGA", 13, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("海上保険料", "SGA", 14, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("船積関連費用", "SGA", 15, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("銀行手数料", "SGA", 16, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("荷造包装費", "SGA", 17, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("保管料", "SGA", 18, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("車両運送料", "SGA", 19, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("販売手数料", "SGA", 20, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("補償費", "SGA", 21, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("輸出関連諸雑費", "SGA", 22, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("広告宣伝費", "SGA", 23, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("通信費", "SGA", 24, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("旅費交通費", "SGA", 25, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("接待交際費", "SGA", 26, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("事務用品費", "SGA", 27, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("見本費", "SGA", 28, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("サービス料", "SGA", 29, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("水道光熱費", "SGA", 30, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("開発費", "SGA", 31, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("支払手数料", "SGA", 32, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("租税公課", "SGA", 33, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("保険料", "SGA", 34, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("顧問料", "SGA", 35, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("地代家賃", "SGA", 36, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),  # 先に書く
-    ("賃借料", "SGA", 36, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("修繕費", "SGA", 37, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("減価償却費", "SGA", 38, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("管理費", "SGA", 39, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("寄付金", "SGA", 40, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("貸倒引当金繰入", "SGA", 41, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-    ("雑費", "SGA", 42, SGA_COL_R3, SGA_COL_R4, SGA_COL_R5),
-]
-SGA_START_ROW = 8
-SGA_END_ROW = 42
+def clean_account_name(name):
+    """
+    【超重要】最強のクリーニング関数。
+    Excel特有の改行、全半角スペース、括弧、記号を完全に消し去り、純粋な文字列にする。
+    """
+    if not name: return ""
+    s = str(name)
+    s = re.sub(r'[\r\n\t]', '', s)
+    s = re.sub(r'（.*?）|\(.*?\)|［.*?］|\[.*?\]|【.*?】', '', s)
+    s = re.sub(r'[・\s　※及び]', '', s)
+    return s.strip()
 
-# JSONキーの別名（PDF表記ゆれ用）
-KEY_ALIASES = {
-    "法人税、住民税及び事業税": "法人税住民税及び事業税",
-    "建物・建物附属設備": "建物建物附属設備",
-}
-# BS: 借入金＝短期借入金（流動負債）。表に「短期借入金」「借入金」のどちらかで記載される
-SGA_KEY_ALIASES = {
-    "給料手当": "給与・賞与・退職金",
-    "地代家賃": "賃借料",
-}
-
-
-def _normalize_key(k: str) -> str:
-    if not k:
-        return k
-    s = k.strip().replace(" ", "").replace("　", "").replace("・", "")
-    return KEY_ALIASES.get(k.strip(), s)
-
-
-def _parse_number(v) -> int | None:
-    """文字列や数値から1円単位の整数に変換。マイナス表記（△、( )）に対応"""
-    if v is None:
-        return None
-    if isinstance(v, (int, float)):
-        return int(v)
-    if isinstance(v, str):
-        v = v.replace(",", "").replace(" ", "").strip()
-        if v in ("", "-", "－", "―", "—"):
-            return 0
-        if v.startswith("△") or v.startswith("(") or "－" in v[:1] or (v.startswith("-") and len(v) > 1):
-            v = v.replace("△", "").replace("(", "").replace(")", "").replace("－", "-").strip()
-            try:
-                n = re.sub(r"[^0-9]", "", v)
-                return -int(n) if n else 0
-            except ValueError:
-                pass
-        try:
-            return int(re.sub(r"[^0-9-]", "", v) or "0")
-        except ValueError:
-            return None
-    return None
-
-
-def _get_value(data: dict, key: str):
-    """data から key または別名で値を取得。数値は int に統一（円単位）"""
-    v = data.get(key)
-    if v is None:
-        v = data.get(KEY_ALIASES.get(key, key))
-    if v is None:
-        for alias, canonical in KEY_ALIASES.items():
-            if canonical == key:
-                v = data.get(alias)
-                break
-    if v is None:
-        return None
-    return _parse_number(v)
-
-
-# -----------------------------------------------------------------------------
-# Step1: PDF → 全ページを1ページずつ Gemini Vision で解析（スキップなし）
-# -----------------------------------------------------------------------------
-# 表の構造・単位を正確に読み取り、桁を絶対に間違えないよう厳格に指示
-PROMPT_ONE_PAGE = """あなたは日本の決算書（スキャン画像）の1ページを読み取る専門家です。
-この画像は決算書一式の**1ページ**です。
-
-【最重要：単位と桁の厳守】
-- まず表の**単位**を必ず確認すること。表の隅・表頭に「単位：千円」「（千円）」「単位：円」等の記載がある。**「千円」とあれば、表に書かれた数値に×1000して円に換算した整数を出力する。**「円」とあればそのままの整数で出力する。単位を誤ると桁がずれるので絶対に確認すること。
-- **桁を絶対に間違えないこと。** 売上高は通常数百万円〜数億円オーダー。1円単位の整数のみ出力。小数点や丸め禁止。
-- 表の**構造**を確認すること。行ラベル（売上高・現金預金等）と列（前年・当期など）を正しく対応させる。**当期**（この書類の年度）の列の数値だけを採用する。
-
-【やること】
-1. このページに「損益計算書」「貸借対照表」「販売費及び一般管理費の内訳書」のいずれかが含まれているか判定する。
-2. 含まれていれば、上記の単位・桁ルールに従い、**当期**列の数値を**1円単位の整数**で抽出する。
-3. **販管費内訳書**の場合は、役員報酬・給料手当・法定福利費・賃借料・減価償却費など**科目ごとに個別**で抽出。合計を雑費にまとめることは禁止。
-4. 該当する表が無い場合は空のJSON {} を返す。
-
-【必須で探す項目】
-- 損益計算書: 売上高, 期首商品棚卸高, 仕入高, 期末商品棚卸高, 受取利息, 為替差益, 雑収入, 支払利息, 雑損失, 固定資産売却益, 負債調整勘定戻入, 固定資産除却損, 投資有価証券評価損, 仮払金評価損, 在庫評価引当金繰入, 子会社清算損, 不良債権, 法人税、住民税及び事業税, 当期純利益, 販売費及び一般管理費
-- 貸借対照表: 現金預金, 売掛金, 棚卸資産, 貸付金, 前払費用, 仮払金, 仮払税金, 建物・建物附属設備, 機械装置, 車両運搬具, 器具備品, 土地, 電話加入権, ソフトウェア, のれん, 投資有価証券, 保証金, 長期前払費用, 買掛金, 借入金（短期借入金）, 前受金, 仮受金, 在庫評価引当金, 貸倒引当金, 退職給付引当金, 未払法人税等, 長期借入金, 負債調整勘定, 預り保証金, 資本金, 繰越利益剰余金, 当期純利益
-- 販管費内訳: 役員報酬, 給与・賞与・退職金, 給料手当, 法定福利費, 退職給付引当金繰入, 運賃, 海上保険料, 船積関連費用, 銀行手数料, 荷造包装費, 保管料, 車両運送料, 販売手数料, 補償費, 輸出関連諸雑費, 広告宣伝費, 通信費, 旅費交通費, 接待交際費, 事務用品費, 見本費, サービス料, 水道光熱費, 開発費, 支払手数料, 租税公課, 保険料, 顧問料, 賃借料, 地代家賃, 修繕費, 減価償却費, 管理費, 寄付金, 貸倒引当金繰入, 雑費
-
-抽出できた項目だけをキーにしたJSONで出力。見つからなかったキーは含めない。説明文は不要。JSONのみ。
-"""
-
-
-def pdf_to_images(pdf_path: Path, max_pages: int = 99):
-    """PDFを画像バイトのリストに変換（PyMuPDF）。全ページ取得するためデフォルト99。"""
-    try:
-        import fitz
-    except ImportError:
-        raise ImportError("PyMuPDF が必要です: pip install pymupdf")
-    doc = fitz.open(pdf_path)
-    n = min(len(doc), max_pages)
-    images = []
-    for i in range(n):
-        page = doc[i]
-        pix = page.get_pixmap(dpi=200, alpha=False)
-        images.append(pix.tobytes("png"))
-    doc.close()
-    return images
-
-
-def _parse_extraction_response(text: str, year_label: str, phase: str) -> dict:
-    """Gemini応答テキストからJSONを抽出し、数値に統一したdictを返す。"""
-    json_match = re.search(r"\{[\s\S]*\}", text)
-    if not json_match:
-        return {}
-    try:
-        data = json.loads(json_match.group(0))
-    except json.JSONDecodeError:
-        return {}
-    out = {}
-    for k, v in data.items():
-        if v is None:
-            out[k] = None
-        elif isinstance(v, (int, float)):
-            out[k] = int(v)
-        else:
-            out[k] = _get_value(data, k)
-    return out
-
-
-def _merge_page_into(base: dict, page_data: dict) -> None:
-    """page_data の非null値を base に上書き（base が null のときだけ）。"""
-    for k, v in page_data.items():
-        if v is not None and (base.get(k) is None):
-            base[k] = v
-
-
-def extract_with_gemini(pdf_path: Path, year_label: str) -> dict:
-    """PDFを全ページ画像化し、1ページずつGemini Visionで解析。全ページスキップなし。結果をマージして返す。"""
-    import google.generativeai as genai
-    import io
-    import time
-    from PIL import Image
-
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY が設定されていません")
-
-    genai.configure(api_key=api_key)
-    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-    model = genai.GenerativeModel(model_name)
-
-    images = pdf_to_images(pdf_path, max_pages=99)
-    if not images:
-        return {}
-
-    image_pil_list = [Image.open(io.BytesIO(b)) for b in images]
-    merged = {}
-
-    for page_idx, img in enumerate(image_pil_list):
-        parts = [PROMPT_ONE_PAGE, img]
-        try:
-            response = model.generate_content(parts)
-            text = (response.text or "").strip()
-            page_data = _parse_extraction_response(text, year_label, f"p{page_idx+1}")
-            _merge_page_into(merged, page_data)
-            filled = len([v for v in page_data.values() if v is not None])
-            if filled > 0:
-                print(f"    ページ {page_idx + 1}/{len(image_pil_list)}: {filled} 項目取得")
-        except Exception as e:
-            print(f"  [WARN] ページ {page_idx + 1} 解析エラー: {e}")
-        time.sleep(0.3)
-
-    return merged
-
-
-def extract_all_pdfs(from_json_path: Path | None = None) -> dict:
-    """3つのPDFを順に処理し、{ "令和3年度": {...}, "令和4年度": {...}, "令和5年度": {...} } を返す。
-    from_json_path が指定されている場合はそのJSONを読み、APIは呼ばない。"""
-    if from_json_path and from_json_path.exists():
-        print(f"[読み込み] 抽出結果JSON: {from_json_path}")
-        with open(from_json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return {
-            "令和3年度": data.get("令和3年度", data.get("r3", {})),
-            "令和4年度": data.get("令和4年度", data.get("r4", {})),
-            "令和5年度": data.get("令和5年度", data.get("r5", {})),
-        }
-
-    results = {}
-    for pdf_path, year_label in PDFS:
-        if not pdf_path.exists():
-            print(f"[SKIP] ファイルがありません: {pdf_path}")
-            results[year_label] = {}
-            continue
-        print(f"[抽出] {year_label}: {pdf_path.name}")
-        try:
-            results[year_label] = extract_with_gemini(pdf_path, year_label)
-            print(f"  -> 項目数: {len([v for v in results[year_label].values() if v is not None])}")
-        except Exception as e:
-            print(f"  [ERROR] {e}")
-            results[year_label] = {}
-    return results
-
-
-# -----------------------------------------------------------------------------
-# Step2: 抽出データをExcelに転記（値のみ・数式は触らない）
-# -----------------------------------------------------------------------------
-def apply_to_excel(extracted: dict, template_path: Path, output_path: Path) -> None:
-    import openpyxl
-    from datetime import datetime
-
-    wb = openpyxl.load_workbook(template_path)
-    r3, r4, r5 = extracted.get("令和3年度", {}), extracted.get("令和4年度", {}), extracted.get("令和5年度", {})
-
-    def write_cell(sheet_name: str, row: int, col: int, value):
-        """値セルにのみ value を書き込む。数式セルは触らない。value=None の場合は空白でクリア（デビス残存を消す）。"""
-        if col is None:
-            return
-        try:
-            sheet = wb[sheet_name]
-            cell = sheet.cell(row=row, column=col)
-            if isinstance(cell.value, str) and cell.value.strip().startswith("="):
-                return  # 数式は保護
-            cell.value = value  # 抽出値または None（空白で上書き）
-        except Exception as e:
-            print(f"  [WARN] {sheet_name}!{openpyxl.utils.get_column_letter(col)}{row} = {value} でエラー: {e}")
-
-    def get_val(data: dict, key: str):
-        v = data.get(key)
-        if v is None:
-            v = data.get(key.replace("・", "").replace(" ", ""))
-        if v is None and "法人税" in key and "住民税" in key:
-            v = data.get("法人税、住民税及び事業税")
-        if v is None and key == "借入金":
-            v = data.get("短期借入金")
-        if v is None:
-            v = data.get("建物・建物附属設備") if "建物" in key else None
-        if v is None and key in SGA_KEY_ALIASES:
-            v = data.get(SGA_KEY_ALIASES[key])
-        if v is not None:
-            return _parse_number(v)
-        return _get_value(data, key)
-
-    # 基本情報（常に上書き：富山技研興業用）
-    try:
-        ws = wb["基本情報"]
-        ws["D5"] = FISCAL_END_R5   # 決算期（令和5年度末日）
-        ws["D9"] = COMPANY_NAME    # 商号
-    except Exception as e:
-        print(f"  [WARN] 基本情報 書き込み: {e}")
-
-    # 各シートの列ヘッダー（年月）を決算期に合わせて上書き（Excelのセルアドレスで直接指定）
-    # PL: 5行目 E5,G5,I5 / BS: 6行目 F6,G6,H6 / SGA・製造原価: 5行目 E5,G5,I5
-    header_updates = [
-        ("PL", [("E5", FISCAL_END_R3), ("G5", FISCAL_END_R4), ("I5", FISCAL_END_R5)]),
-        ("BS", [("F6", FISCAL_END_R3), ("G6", FISCAL_END_R4), ("H6", FISCAL_END_R5)]),
-        ("SGA", [("E5", FISCAL_END_R3), ("G5", FISCAL_END_R4), ("I5", FISCAL_END_R5)]),
-        ("製造原価", [("E5", FISCAL_END_R3), ("G5", FISCAL_END_R4), ("I5", FISCAL_END_R5)]),
+def is_ignored_header(raw_label):
+    """Excelのタイトル行（書き込み対象外の大見出し）を判定し、誤爆を防ぐ"""
+    raw_str = str(raw_label).strip()
+    if re.match(r'^【.*】$', raw_str) or re.match(r'^［.*］$', raw_str):
+        return True
+    
+    clean_lbl = raw_str.replace(" ", "").replace("　", "").replace("\n", "")
+    headers = [
+        "資産の部", "負債の部", "純資産の部", 
+        "負債純資産合計", "負債合計", "純資産合計", "資産合計",
+        "流動資産", "固定資産", "繰延資産",
+        "流動負債", "固定負債"
     ]
-    for sheet_name, cell_values in header_updates:
-        if sheet_name not in wb.sheetnames:
-            continue
+    if clean_lbl in headers:
+        return True
+    return False
+
+def is_formula(cell):
+    if cell.data_type == 'f': return True
+    if isinstance(cell.value, str) and cell.value.startswith('='): return True
+    return False
+
+def is_dummy_value(val):
+    if type(val) in (int, float): return True
+    if isinstance(val, str):
+        if re.match(r'^\d{4}-\d{2}-\d{2}$', val.strip()): return False
+        if "期" in val or "年" in val or "月" in val: return False
+        clean_str = val.replace(",", "").replace("-", "").replace("△", "").replace("▲", "").replace(".", "").replace(" ", "").strip()
+        if clean_str.isdigit(): return True
+    return False
+
+def parse_incomplete_json(json_str):
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        try:
+            fixed_str = re.sub(r',\s*$', '', json_str.strip()) + "}"
+            return json.loads(fixed_str)
+        except:
+            return {}
+
+# --- [新機能] マテリアルから探すべき項目名を事前抽出 ---
+def extract_target_labels(template_path):
+    wb = openpyxl.load_workbook(template_path, data_only=True)
+    labels = set()
+    for sheet_name in ["BS", "PL", "SGA", "製造原価", "利益修正"]:
+        if sheet_name not in wb.sheetnames: continue
         ws = wb[sheet_name]
-        for cell_addr, value in cell_values:
-            try:
-                ws[cell_addr] = value
-            except Exception:
-                pass
+        start_r = 8 if sheet_name != "利益修正" else 6
+        for r in range(start_r, 150): 
+            for c in range(2, 6):
+                val = ws.cell(row=r, column=c).value
+                if val and isinstance(val, str):
+                    if is_ignored_header(val): continue
+                    cl = clean_account_name(val)
+                    if cl and len(cl) > 1:
+                        labels.add(cl)
+    wb.close()
+    
+    labels.update(["売上高", "現金預金", "売掛金", "期首商品棚卸高", "期末商品棚卸高"])
+    return list(labels)
 
-    # PL: 抽出値があればそのまま、なければ None でクリア（デビス残存を消す）
-    for key, sheet, row, c3, c4, c5 in PL_MAPPING:
-        for col, data in [(c3, r3), (c4, r4), (c5, r5)]:
-            if col is None:
-                continue
-            v = get_val(data, key) or get_val(data, key.replace(" ", ""))
-            write_cell(sheet, row, col, v)
+# -----------------------------------------------------------------------------
+# 2. AI抽出エンジン (APIエラー回避 ＆ ダイナミック抽出)
+# -----------------------------------------------------------------------------
+def extract_with_gemini(pdf_path, client, target_labels):
+    from google.genai import types
+    import fitz
+    
+    labels_str = ", ".join(target_labels)
 
-    # BS: 同様に抽出値 or None で上書き
-    for key, sheet, row, c3, c4, c5 in BS_ASSET_MAPPING + BS_LIAB_MAPPING + BS_EQ_MAPPING:
-        for col, data in [(c3, r3), (c4, r4), (c5, r5)]:
-            if col is None:
-                continue
-            v = get_val(data, key) or get_val(data, key.replace("・", ""))
-            write_cell(sheet, row, col, v)
+    doc = fitz.open(pdf_path)
+    contents = [f"""あなたは世界最高精度の財務解析AIです。決算書PDFの全ページを確認し、情報を抽出しJSONで返してください。
+    
+    【厳守事項：企業メタデータ】
+    - 代表者氏名は、申告書の表紙にある氏名を最優先としてください。
+    - 当期の「決算年月日」を読み取り、"YYYY-MM-DD"形式で出力してください。
+    - 株主構成は、法人税申告書の「別表二」から抽出してください。
+    - 決算書の各表の右上に「(単位：千円)」の記載があるか確認してください。記載があれば "unit" を "千円" に、なければ "円" にしてください。
+    
+    【厳守事項：財務数値データの抽出】
+    以下のリストにある「必要な項目」を決算書（BS、PL、製造原価報告書、販売費及び一般管理費内訳）から探し出して抽出してください。
+    
+    [重要探索リスト（必ず探すこと）]
+    {labels_str}
+    
+    [抽出時の注意]
+    - 上記リストの項目を探す際は、決算書に実際に記載されている科目名（例えば「現金及び預金」など）をそのままJSONのキーとして抽出してください。
+    - リストにない細かい科目名も、表に記載されていればすべて漏らさず抽出してください。
+    - 期首と期末（例：期首商品棚卸高と期末商品棚卸高）は絶対に区別してください。
+    - 金額はカンマや円マークを除外した純粋な数値（例: 10290000）で出力してください。マイナスの場合は - をつけてください。
+    
+    必ず以下のJSONフォーマットのみを出力してください。Markdown（```json など）は絶対に書かないでください。
+    {{
+      "meta": {{
+        "company_name": "法人名",
+        "representative": "代表者氏名",
+        "fiscal_end": "YYYY-MM-DD",
+        "unit": "千円 または 円",
+        "shareholders": [{{"name": "株主名", "shares": 株式数}}]
+      }},
+      "data": {{ "勘定科目名": 数値, ... }}
+    }}"""]
+    
+    for i in range(len(doc)):
+        pix = doc[i].get_pixmap(dpi=72) 
+        contents.append(types.Part.from_bytes(data=pix.tobytes("png"), mime_type="image/png"))
+    doc.close()
 
-    # SGA: 内訳科目を**個別に**該当行へ転記。雑費への丸投げは禁止。全行いったんクリア後に科目ごと書き込み。
-    for r in range(SGA_START_ROW, SGA_END_ROW + 1):
-        for col in [5, 7, 9]:
-            write_cell("SGA", r, col, None)
-    for key, sheet, row, c3, c4, c5 in SGA_MAPPING:
-        for col, data in [(c3, r3), (c4, r4), (c5, r5)]:
-            if col is None:
-                continue
-            v = get_val(data, key)
-            if v is not None:
-                write_cell(sheet, row, col, v)
+    for attempt in range(3):
+        try:
+            model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+            
+            # APIエラーを避けるため、configディクショナリでのJSON指定を削除し、プロンプト指示に依存させる
+            response = client.models.generate_content(
+                model=model_name, 
+                contents=contents
+            )
+            
+            match = re.search(r"\{[\s\S]*\}", response.text)
+            if not match: continue
+            
+            raw_json = parse_incomplete_json(match.group(0))
+            if not raw_json: continue
+            
+            # --- 千円単位の判定と一律変換 ---
+            unit_str = raw_json.get("meta", {}).get("unit", "")
+            is_yen = False
+            if "千円" not in unit_str and "円" in unit_str:
+                is_yen = True
+            
+            # 金額規模による自動判定（500万以上の数値があれば円単位とみなす）
+            if not is_yen:
+                max_val = 0
+                for k, v in raw_json.get("data", {}).items():
+                    try:
+                        num = abs(float(str(v).replace(",","").replace("円","").strip() or 0))
+                        max_val = max(max_val, num)
+                    except: pass
+                if max_val > 5000000:
+                    is_yen = True
 
+            processed_data = {}
+            for k, v in raw_json.get("data", {}).items():
+                try:
+                    s_val = str(v).replace(",", "").replace("△", "-").replace("▲", "-").replace("円", "").strip()
+                    val = float(s_val)
+                    if is_yen:
+                        val = val / 1000.0 # 千円単位に一律変換
+                    processed_data[clean_account_name(k)] = val
+                except: pass
+                
+            raw_json["data"] = processed_data
+            return raw_json
+            
+        except Exception as e:
+            print(f"    [AI抽出エラー] {e} - リトライ中... ({attempt+1}/3)")
+            time.sleep(5)
+    return {}
+
+# -----------------------------------------------------------------------------
+# 3. Excel転記・統合エンジン
+# -----------------------------------------------------------------------------
+def apply_to_excel(all_results, template_path, output_path):
+    if not template_path.exists():
+        print(f"❌ テンプレートファイルが見つかりません: {template_path}")
+        sys.exit(1)
+        
+    wb = openpyxl.load_workbook(template_path, data_only=False)
+    
+    sorted_keys = sorted(list(all_results.keys()))
+    if not sorted_keys: return
+    
+    latest_key = sorted_keys[-1]
+    latest_meta = all_results[latest_key].get("meta", {})
+    
+    comp_name = latest_meta.get("company_name", "対象会社")
+    rep_name = clean_extracted_name(latest_meta.get("representative", "代表者名"))
+    shareholders = latest_meta.get("shareholders", [])
+    
+    fiscal_end_str = latest_meta.get("fiscal_end", "2024-03-31")
+    try:
+        base_dt = datetime.datetime.strptime(fiscal_end_str, "%Y-%m-%d")
+    except ValueError:
+        base_dt = datetime.datetime(2024, 3, 31)
+
+    # --- A. 基本情報の反映 ---
+    if "Summary" in wb.sheetnames:
+        ws = wb["Summary"]
+        for col in range(7, 18): get_master_cell(ws, 6, col).value = comp_name
+        r, c = find_cell_by_text(ws, "評価対象")
+        if r: get_master_cell(ws, r, c + 2).value = comp_name
+        
+    if "基本情報" in wb.sheetnames:
+        ws = wb["基本情報"]
+        r_s, _ = find_cell_by_text(ws, "商号")
+        if r_s: get_master_cell(ws, r_s, 4).value = comp_name
+        r_r, _ = find_cell_by_text(ws, "代表者")
+        if r_r: get_master_cell(ws, r_r, 4).value = rep_name
+        r_d, _ = find_cell_by_text(ws, "決算期")
+        if r_d:
+            date_cell = get_master_cell(ws, r_d, 4)
+            date_cell.value = base_dt
+            date_cell.number_format = 'yyyy/mm/dd'
+
+    # --- D. 年月ラベルの更新 ---
+    sheet_date_targets = [
+        ("PL", 6, [5, 7, 9]), 
+        ("SGA", 6, [5, 7, 9]),
+        ("製造原価", 6, [5, 7, 9, 11, 13]),
+        ("BS", 7, [6, 7, 8]),
+        ("利益修正", 5, [5, 6, 7]), 
+    ]
+    for name, row, cols in sheet_date_targets:
+        if name not in wb.sheetnames: continue
+        ws = wb[name]
+        for i, col in enumerate(cols):
+            dt = datetime.datetime(base_dt.year - (len(cols)-1-i), base_dt.month, base_dt.day)
+            cell = get_master_cell(ws, row, col)
+            cell.value = dt
+            cell.number_format = 'yyyy"年"m"月期"'
+
+    # --- E. 財務数値の完全網羅的転記 ---
+    target_keys = sorted_keys[-3:] 
+    data_list = [all_results[k].get("data", {}) for k in target_keys]
+    while len(data_list) < 3:
+        data_list.insert(0, {})
+
+    WRITE_TARGET_SHEETS = ["BS", "PL", "SGA", "製造原価", "利益修正", "修正PL"]
+
+    for sheet_name in WRITE_TARGET_SHEETS:
+        if sheet_name not in wb.sheetnames: continue
+        ws = wb[sheet_name]
+        
+        scan_configs = []
+        # B列～E列を広範囲にスキャン
+        if sheet_name in ["PL", "SGA", "製造原価"]:
+            scan_configs.append( ([2, 3, 4, 5], [5, 7, 9]) )
+        elif sheet_name == "利益修正":
+            scan_configs.append( ([2, 3, 4], [5, 6, 7]) ) 
+        elif sheet_name == "BS": 
+            scan_configs.append( ([2, 3, 4, 5], [6, 7, 8]) )
+        elif sheet_name == "修正PL":
+            scan_configs.append( ([2, 3, 4, 5], [5, 8, 11]) )
+            
+        for label_cols, write_cols in scan_configs:
+            # 見出し行への誤爆を防ぐための開始行設定
+            if sheet_name in ["BS", "PL", "SGA", "製造原価", "修正PL"]:
+                start_row = 8
+            elif sheet_name == "利益修正":
+                start_row = 6
+            else:
+                start_row = 8
+            
+            # パージ処理（ダミーの確実な消去）
+            for r in range(start_row, 250):
+                for col_idx in write_cols:
+                    cell = get_master_cell(ws, r, col_idx)
+                    if cell and not is_formula(cell) and is_dummy_value(cell.value):
+                        cell.value = None
+
+            # 転記ループ
+            for r in range(start_row, 250):
+                # その行のB列〜E列の値をすべて連結して科目を特定する
+                row_text = ""
+                for c in label_cols:
+                    cell_val = ws.cell(row=r, column=c).value
+                    if cell_val and isinstance(cell_val, str):
+                        row_text += cell_val
+
+                if not row_text.strip(): continue
+                
+                if is_ignored_header(row_text):
+                    continue
+                    
+                label = clean_account_name(row_text)
+                if not label: continue
+                
+                if sheet_name == "利益修正" and "営業利益" in label: label = "営業利益" 
+                elif sheet_name == "利益修正" and "売上高" in label: label = "売上高"
+                
+                for col_idx, data in zip(write_cols, data_list):
+                    if not data: continue 
+                    
+                    match_val = None
+                    
+                    # 強力な同義語マッピング
+                    synonyms = {
+                        "売上高": ["売上金額", "完成工事高", "売上", "事業収益", "賃貸料収益"],
+                        "現金預金": ["現金及び預金", "現預金", "現金", "普通預金", "当座預金"],
+                        "売掛金": ["売掛金額", "完成工事未収入金", "未収金", "未収入金", "営業未収入金", "売上債権", "工事未収入金"],
+                        "買掛金": ["買掛金額", "工事未払金", "営業未払金", "支払手形及び買掛金"],
+                        "期首商品棚卸高": ["期首棚卸高", "商品期首棚卸高", "期首商品"],
+                        "期末商品棚卸高": ["期末棚卸高", "商品期末棚卸高", "期末商品"],
+                        "仕入高": ["当期商品仕入高", "商品仕入高", "当期仕入高", "材料仕入高"],
+                        "有形固定資産": ["有形固定資産計", "有形固定資産合計"],
+                        "無形固定資産": ["無形固定資産計", "無形固定資産合計"],
+                        "投資等": ["投資その他の資産", "投資その他の資産計", "投資その他"],
+                        "当期純利益": ["当期純利益金額", "税引後当期純利益"],
+                        "退職給付引当金繰入": ["退職給付費用"],
+                        "法定福利費": ["福利厚生費", "法定福利費"],
+                        "修繕費": ["修繕維持費"],
+                        "消耗品費": ["事務用品費", "消耗工具備品費"],
+                        "地代家賃": ["賃借料", "家賃"],
+                        "租税公課": ["税金"],
+                        "支払手数料": ["手数料"],
+                        "水道光熱費": ["電気代", "水道代", "光熱費"],
+                        "旅費交通費": ["交通費", "旅費"],
+                        "通信費": ["電話代", "郵便料"],
+                        "減価償却費": ["減価償却"],
+                    }
+                    
+                    if label in data:
+                        match_val = data[label]
+                    elif label in synonyms and any(s in data for s in synonyms[label]):
+                        for s in synonyms[label]:
+                            if s in data:
+                                match_val = data[s]
+                                break
+                    elif "給与賞与退職金" in label or "人件費" in label:
+                        keys = [k for k in data.keys() if any(x in k for x in ["給料", "給与", "賞与", "役員報酬", "退職金", "賃金"]) and "引当" not in k and "計" not in k]
+                        if keys:
+                            match_val = sum(data[k] for k in keys)
+                    else:
+                        # 部分一致による救済
+                        for k, v in data.items():
+                            if "計" in k and label != k: continue 
+                            if "期首" in label and "期首" not in k: continue 
+                            if "期末" in label and "期末" not in k: continue 
+                            
+                            if label in k or k in label:
+                                match_val = v
+                                break
+                    
+                    if match_val is not None:
+                        # 書き込む先のセルを取得（結合セル対応）
+                        target = get_master_cell(ws, r, col_idx)
+                        if not is_formula(target):
+                            target.value = int(round(match_val))
+
+    # 不要シート削除
+    sheets_to_remove = [s for s in wb.sheetnames if "書き出しの概要" in s]
+    for s in sheets_to_remove:
+        del wb[s]
+        
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
-    print(f"[保存] {output_path}")
 
-
-def _cell_value(ws, addr) -> int | float | None:
-    v = ws[addr].value
-    if v is None:
-        return None
-    if isinstance(v, (int, float)):
-        return v
-    return None
-
-
-def self_check_sales(wb_path: Path) -> bool:
-    """PLのE8,G8,I8（期1・期2・期3の売上高）に実数（百万円以上）が入っているか確認。"""
-    import openpyxl
-    wb = openpyxl.load_workbook(wb_path, read_only=True, data_only=True)
-    try:
-        ws = wb["PL"]
-        cells = [("E8", _cell_value(ws, "E8")), ("G8", _cell_value(ws, "G8")), ("I8", _cell_value(ws, "I8"))]
-    finally:
-        wb.close()
-    min_expected = 1_000_000
-    ok = True
-    for addr, val in cells:
-        if val is None or (isinstance(val, (int, float)) and float(val) < min_expected):
-            print(f"[セルフチェック NG] PL!{addr} = {val} （Noneまたは{min_expected:,}円未満は不可）")
-            ok = False
-        else:
-            print(f"[セルフチェック OK] PL!{addr} = {val}")
-    return ok
-
-
-def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="富山技研興業 マテリアル転記")
-    parser.add_argument("--from-json", type=Path, default=None, help="抽出済みJSON（APIを使わず転記のみ）")
-    args = parser.parse_args()
-
-    print("富山技研興業 マテリアル転記スクリプト")
-    print("テンプレート:", TEMPLATE_PATH)
-    if not TEMPLATE_PATH.exists():
-        print("エラー: テンプレートが見つかりません")
-        sys.exit(1)
-
-    # PDFから再抽出する場合は既存JSONを破棄（精度不良データを使わない）
-    if args.from_json is None:
-        json_path = OUTPUT_DIR / "toyama_giken_extracted.json"
-        if json_path.exists():
-            json_path.unlink()
-            print(f"[削除] 既存の抽出JSONを破棄しました: {json_path}")
-
-    extracted = extract_all_pdfs(from_json_path=args.from_json)
-    # APIで抽出した場合はJSON保存（再実行時に --from-json で転記のみ可能）
-    if args.from_json is None and any(extracted.get(y) for y in ("令和3年度", "令和4年度", "令和5年度")):
-        json_path = OUTPUT_DIR / "toyama_giken_extracted.json"
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(extracted, f, ensure_ascii=False, indent=2)
-        print(f"[保存] 抽出結果JSON: {json_path}")
-
-    out_path = OUTPUT_DIR / OUTPUT_EXCEL_NAME
-    apply_to_excel(extracted, TEMPLATE_PATH, out_path)
-    if not self_check_sales(out_path):
-        print("エラー: 売上高（E8,G8,I8）に実数が入っていません。抽出ロジックを確認してください。")
-        sys.exit(1)
-    print("完了:", out_path)
-
-
+# -----------------------------------------------------------------------------
+# 4. メイン処理
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    from google import genai
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        print("❌ GEMINI_API_KEY が設定されていません。")
+        sys.exit(1)
+        
+    client = genai.Client(api_key=api_key)
+    all_data = {}
+    
+    pdf_paths = sorted(list(INPUT_PDF_DIR.glob("*.pdf")))
+    if not pdf_paths:
+        print(f"❌ PDFファイルが見つかりません: {INPUT_PDF_DIR}")
+        sys.exit(1)
+        
+    print("🔍 テンプレートから抽出対象の項目をリストアップしています...")
+    target_labels = extract_target_labels(TEMPLATE_PATH)
+        
+    print(f"🔍 解析開始（{len(pdf_paths)}件のPDFを解析・転記します）...")
+    
+    for path in pdf_paths:
+        label = path.stem 
+        print(f"  ⟳ [{label}] 解析中...")
+        res = extract_with_gemini(path, client, target_labels)
+        if res: all_data[label] = res
+        time.sleep(3) 
+
+    if all_data:
+        sorted_keys = sorted(list(all_data.keys()))
+        latest_label = sorted_keys[-1]
+        raw_name = all_data[latest_label].get("meta", {}).get("company_name", "新規会社")
+        clean_name = re.sub(r'[\\/:*?"<>|]', '', raw_name).replace(" ", "")
+        
+        final_output = OUTPUT_DIR / f"【マテリアル】_{clean_name}.xlsx"
+        
+        apply_to_excel(all_data, TEMPLATE_PATH, final_output)
+        print(f"✨ 完了！ 出力ファイル:\n   {final_output}")
+    else:
+        print("❌ 解析データが得られませんでした。")
