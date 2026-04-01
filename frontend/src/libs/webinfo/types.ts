@@ -81,3 +81,22 @@ export interface CompanyWebInfo {
   errorMessage?: string;
 }
 
+/**
+ * PostgreSQL 検索API（例: backend/scripts/search_ui_optimized.py）の企業オブジェクトと
+ * マージする際に使うフィールド（camelCase）。すべて任意。
+ */
+export interface CompanyPostgresApiFields {
+  latestProfit?: number | null;
+  /** latest_profit と同値（円ベース） */
+  profit?: number | null;
+  latestFiscalYearMonth?: string | null;
+  representativeBirthDate?: string | null;
+  shareholders?: unknown;
+  suppliers?: unknown;
+  executives?: unknown;
+  sbFlag?: boolean | null;
+  ndaFlag?: boolean | null;
+  adFlag?: boolean | null;
+  isActive?: boolean | null;
+}
+

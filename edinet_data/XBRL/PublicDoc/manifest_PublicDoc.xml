@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns="http://disclosure.edinet-fsa.go.jp/2013/manifest">
+  <tocComposition>
+    <title xml:lang="ja">提出本文書</title>
+    <title xml:lang="en">Main Document</title>
+    <item ref="jpsps070000" extrole="http://disclosure.edinet-fsa.go.jp/role/jpsps/rol_CabinetOfficeOrdinanceOnDisclosureOfInformationEtcOnSpecifiedSecuritiesFormNo7AnnualSecuritiesReport" in="presentation" />
+  </tocComposition>
+  <list>
+    <instance id="jpsps070000" type="PublicDoc" preferredFilename="jpsps070000-asr-001_G02386-000_2025-03-27_01_2025-06-27.xbrl">
+      <ixbrl>0000000_header_jpsps070000-asr-001_G02386-000_2025-03-27_01_2025-06-27_ixbrl.htm</ixbrl>
+      <ixbrl>0201010_honbun_jpsps070000-asr-001_G02386-000_2025-03-27_01_2025-06-27_ixbrl.htm</ixbrl>
+      <ixbrl>0204010_honbun_jpsps070000-asr-001_G02386-000_2025-03-27_01_2025-06-27_ixbrl.htm</ixbrl>
+      <ixbrl>0204020_honbun_jpsps070000-asr-001_G02386-000_2025-03-27_01_2025-06-27_ixbrl.htm</ixbrl>
+      <ixbrl>0204030_honbun_jpsps070000-asr-001_G02386-000_2025-03-27_01_2025-06-27_ixbrl.htm</ixbrl>
+      <ixbrl>0204040_honbun_jpsps070000-asr-001_G02386-000_2025-03-27_01_2025-06-27_ixbrl.htm</ixbrl>
+      <ixbrl>0204050_honbun_jpsps070000-asr-001_G02386-000_2025-03-27_01_2025-06-27_ixbrl.htm</ixbrl>
+      <ixbrl>0301010_honbun_jpsps070000-asr-001_G02386-000_2025-03-27_01_2025-06-27_ixbrl.htm</ixbrl>
+    </instance>
+  </list>
+</manifest>

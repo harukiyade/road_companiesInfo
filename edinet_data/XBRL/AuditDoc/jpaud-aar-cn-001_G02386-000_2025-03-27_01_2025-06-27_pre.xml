@@ -1,0 +1,10 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!-- Edited with FutureStage XBRL Solution Library .NET 01-11 -->
+<link:linkbase xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:link="http://www.xbrl.org/2003/linkbase">
+  <link:roleRef xlink:type="simple" xlink:href="http://disclosure.edinet-fsa.go.jp/taxonomy/jpsps/2023-12-01/jpsps_rt_2023-12-01.xsd#rol_IndependentAuditorsReport" roleURI="http://disclosure.edinet-fsa.go.jp/role/jpsps/rol_IndependentAuditorsReport" />
+  <link:presentationLink xlink:type="extended" xlink:role="http://disclosure.edinet-fsa.go.jp/role/jpsps/rol_IndependentAuditorsReport">
+    <link:loc xlink:type="locator" xlink:href="http://disclosure.edinet-fsa.go.jp/taxonomy/jpsps/2023-12-01/jpsps_cor_2023-12-01.xsd#jpsps_cor_IndependentAuditorsReportFundTextBlock" xlink:label="jpsps_cor_IndependentAuditorsReportFundTextBlock" />
+    <link:loc xlink:type="locator" xlink:href="http://disclosure.edinet-fsa.go.jp/taxonomy/jpsps/2023-12-01/jpsps_cor_2023-12-01.xsd#jpsps_cor_IndependentAuditorsReportHeading" xlink:label="jpsps_cor_IndependentAuditorsReportHeading" />
+    <link:presentationArc xlink:type="arc" xlink:from="jpsps_cor_IndependentAuditorsReportHeading" xlink:to="jpsps_cor_IndependentAuditorsReportFundTextBlock" xlink:arcrole="http://www.xbrl.org/2003/arcrole/parent-child" order="1" />
+  </link:presentationLink>
+</link:linkbase>

@@ -8,7 +8,7 @@ Legatus ONE 企業DBを完成させるためのリッチデータ投入スクリ
 - 対象: fixed_csv_3 配下の全CSV（パスに /later/ を含むものは除外）
 
 【照合】4段階で1件に特定できた場合のみUPDATE。0件/複数ヒットは skipped_reasons に記録しスキップ。
-【マッピング】売上・利益は百万円→円、設立はExcelシリアル→日付文字列、説明→overview/概要→business_descriptions。
+【マッピング】売上・利益は百万円→円、設立はカレンダー表現のみ（YYYY-MM-DD 等）→日付文字列（Excelシリアルは設立に使わない）、説明→overview/概要→business_descriptions。
   拠点数はbigintへ。
   ★重要: 取締役(executives)はカンマ区切りのtext型へ、株主・取引先銀行はARRAY型(list)として渡す。
 """
@@ -18,12 +18,19 @@ import logging
 import os
 import re
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 # プロジェクトルートの .env を優先して読み込む
 _script_dir = Path(__file__).resolve().parent
 _project_root = _script_dir.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+from backend.api.csv_founding_date import (
+    founding_cell_to_iso_and_year,
+    parse_birth_cell_to_date,
+    parse_year_from_founding_cell,
+)
 try:
     from dotenv import load_dotenv
     load_dotenv(_project_root / ".env")
@@ -41,7 +48,7 @@ csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
 DB_HOST = os.getenv("POSTGRES_HOST", "34.84.189.233")
 DB_PORT = os.getenv("POSTGRES_PORT", "5432")
 DB_USER = os.getenv("POSTGRES_USER", "postgres")
-DB_PASSWORD = os.getenv("POSTGRES_PASSWORD", "Legatus2000/") # 修正: 空文字から修正
+DB_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
 DB_NAME = os.getenv("POSTGRES_DB", "postgres")
 DB_SSLMODE = os.getenv("POSTGRES_SSLMODE", "require")
 
@@ -164,47 +171,6 @@ def extract_prefecture(addr):
         if pref in s:
             return pref
     return None
-
-
-# --- Excelシリアル日付変換（1900年1月1日 = 1 のWindows基準）---
-EXCEL_EPOCH = datetime(1899, 12, 30)
-
-
-def excel_serial_to_date(val):
-    """
-    CSVの「設立」: Excelシリアル（例 44774）または日付文字列を (date_str, year_int) に変換。
-    Returns (YYYY-MM-DD or None, year or None).
-    """
-    if val is None:
-        return None, None
-    s = str(val).strip()
-    if not s or s.lower() in ("nan", "none", "null"):
-        return None, None
-    # 数値のみならExcelシリアルとみなす
-    num_part = re.sub(r"[^\d\.\-]", "", s)
-    if num_part:
-        try:
-            serial = float(num_part)
-            if 1 <= serial <= 2958465:  # 日付として妥当な範囲
-                d = EXCEL_EPOCH + timedelta(days=int(serial))
-                return d.strftime("%Y-%m-%d"), d.year
-        except (ValueError, OverflowError):
-            pass
-    # 日付文字列パターン（日本語は長いので s 全体を使用）
-    for fmt, use_s in (("%Y年%m月%d日", s), ("%Y-%m-%d", s[:10]), ("%Y/%m/%d", s[:10]), ("%Y%m%d", s[:8]), ("%Y年%m月", s)):
-        try:
-            d = datetime.strptime(use_s.replace(" ", ""), fmt.replace(" ", ""))
-            if d.year and 1900 <= d.year <= 2100:
-                return d.strftime("%Y-%m-%d"), d.year
-        except ValueError:
-            continue
-    # 年のみ
-    m = re.search(r"(\d{4})年?", s)
-    if m:
-        y = int(m.group(1))
-        if 1900 <= y <= 2100:
-            return None, y
-    return None, None
 
 
 def parse_int_safe(val):
@@ -382,7 +348,7 @@ def build_header_index(headers):
     return index
 
 
-def row_to_update_payload(row, idx_map, file_path):
+def row_to_update_payload(row, idx_map, file_path, row_num=0):
     """1行からUPDATE用の辞書を生成。id は含めない。"""
     def get(col):
         i = idx_map.get(col)
@@ -404,7 +370,17 @@ def row_to_update_payload(row, idx_map, file_path):
         return None, False
 
     established_val = get("established")
-    date_str, year_int = excel_serial_to_date(established_val)
+    date_str, year_int = founding_cell_to_iso_and_year(established_val)
+    if year_int is None and established_val:
+        year_int = parse_year_from_founding_cell(established_val)
+    if established_val and not date_str and year_int is None:
+        logger.warning(
+            "設立をパースできません（established は更新しません）: file=%s line=%s company=%r value=%r",
+            getattr(file_path, "name", file_path),
+            row_num,
+            name,
+            established_val,
+        )
 
     is_million_unit = "unit_million" in str(file_path)
     latest_revenue = parse_revenue_million_to_yen(get("latest_revenue"), is_million_unit)
@@ -426,7 +402,8 @@ def row_to_update_payload(row, idx_map, file_path):
 
     # birth_dateの処理 (text型)
     birth_raw = get("representative_birth_date")
-    bd_str, _ = excel_serial_to_date(birth_raw) if birth_raw else (None, None)
+    bd = parse_birth_cell_to_date(birth_raw) if birth_raw else None
+    bd_str = bd.isoformat() if bd else None
 
     payload = {
         "id": company_id,
@@ -477,7 +454,7 @@ def process_file(conn, file_path, stats):
                 row_num += 1
                 if len(row) < 2:
                     continue
-                payload, resolved = row_to_update_payload(row, idx_map, file_path)
+                payload, resolved = row_to_update_payload(row, idx_map, file_path, row_num)
                 if resolved and payload:
                     updates.append(payload)
     except Exception as e:

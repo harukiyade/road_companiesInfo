@@ -11,7 +11,7 @@ import os
 import sys
 from typing import Optional, List, Dict, Any
 from datetime import datetime
-from sqlalchemy import create_engine, Column, String, Integer, BigInteger, Text, Date, Numeric, ARRAY, JSONB, Index
+from sqlalchemy import create_engine, Column, String, Integer, BigInteger, Text, Date, Numeric, Boolean, ARRAY, JSONB, Index
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY
@@ -65,6 +65,10 @@ class Company(Base):
     update_count = Column(Integer, default=0)
     change_count = Column(Integer, default=0)
     qualification_grade = Column(String(100))
+    sb_flag = Column(Boolean)
+    nda_flag = Column(Boolean)
+    ad_flag = Column(Boolean)
+    is_active = Column(Boolean)
     
     # 所在地情報
     prefecture = Column(String(50))
@@ -333,6 +337,8 @@ def search_companies(params: SearchParams) -> Dict[str, Any]:
                 'revenue': company.revenue,
                 'latestRevenue': company.latest_revenue,
                 'latestProfit': company.latest_profit,
+                # UI / Firestore 互換: 直近利益（円）。DB 列は latest_profit
+                'profit': company.latest_profit,
                 'operatingIncome': company.operating_income,
                 'totalAssets': company.total_assets,
                 'netAssets': company.net_assets,
@@ -340,8 +346,21 @@ def search_companies(params: SearchParams) -> Dict[str, Any]:
                 'marketSegment': company.market_segment,
                 'employeeCount': company.employee_count,
                 'established': company.established.isoformat() if company.established else None,
+                'founding': company.founding.isoformat() if company.founding else None,
+                'foundingYear': company.founding_year,
+                'latestFiscalYearMonth': company.latest_fiscal_year_month,
+                'sbFlag': company.sb_flag,
+                'ndaFlag': company.nda_flag,
+                'adFlag': company.ad_flag,
+                'isActive': company.is_active,
+                'representativeBirthDate': (
+                    company.representative_birth_date.isoformat()
+                    if company.representative_birth_date
+                    else None
+                ),
                 'overview': company.overview,
                 'companyDescription': company.company_description,
+                'businessSummary': company.business_summary,
             }
             
             # JSONBフィールドの処理
@@ -350,6 +369,25 @@ def search_companies(params: SearchParams) -> Dict[str, Any]:
                     company_dict['executives'] = json.loads(company.executives)
                 else:
                     company_dict['executives'] = company.executives
+
+            if company.shareholders is not None:
+                sh = company.shareholders
+                if isinstance(sh, str):
+                    try:
+                        company_dict['shareholders'] = json.loads(sh)
+                    except json.JSONDecodeError:
+                        company_dict['shareholders'] = sh
+                else:
+                    company_dict['shareholders'] = sh
+            if company.suppliers is not None:
+                su = company.suppliers
+                if isinstance(su, str):
+                    try:
+                        company_dict['suppliers'] = json.loads(su)
+                    except json.JSONDecodeError:
+                        company_dict['suppliers'] = su
+                else:
+                    company_dict['suppliers'] = su
             
             if company.financials:
                 if isinstance(company.financials, str):

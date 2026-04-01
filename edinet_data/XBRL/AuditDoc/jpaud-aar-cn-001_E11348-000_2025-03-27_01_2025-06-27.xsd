@@ -1,0 +1,14 @@
+﻿<?xml version="1.0"?>
+<!-- Edited with FutureStage XBRL Solution Library .NET 01-11 -->
+<schema xmlns:link="http://www.xbrl.org/2003/linkbase" xmlns:xbrli="http://www.xbrl.org/2003/instance" xmlns:jpaud-aar-cn_E11348-000="http://disclosure.edinet-fsa.go.jp/jpaud/aar/cn/001/E11348-000/2025-03-27/01/2025-06-27" xmlns:xlink="http://www.w3.org/1999/xlink" elementFormDefault="qualified" targetNamespace="http://disclosure.edinet-fsa.go.jp/jpaud/aar/cn/001/E11348-000/2025-03-27/01/2025-06-27" xmlns="http://www.w3.org/2001/XMLSchema">
+  <import schemaLocation="http://disclosure.edinet-fsa.go.jp/taxonomy/jpsps/2023-12-01/jpsps_cor_2023-12-01.xsd" namespace="http://disclosure.edinet-fsa.go.jp/taxonomy/jpsps/2023-12-01/jpsps_cor" />
+  <import schemaLocation="http://disclosure.edinet-fsa.go.jp/taxonomy/jpsps/2023-12-01/jpsps_rt_2023-12-01.xsd" namespace="http://disclosure.edinet-fsa.go.jp/taxonomy/jpsps/2023-12-01/jpsps_rt" />
+  <annotation>
+    <appinfo>
+      <link:linkbaseRef xlink:type="simple" xlink:href="http://disclosure.edinet-fsa.go.jp/taxonomy/jpsps/2023-12-01/label/jpsps_2023-12-01_lab.xml" xlink:role="http://www.xbrl.org/2003/role/labelLinkbaseRef" xlink:arcrole="http://www.w3.org/1999/xlink/properties/linkbase" />
+      <link:linkbaseRef xlink:type="simple" xlink:href="http://disclosure.edinet-fsa.go.jp/taxonomy/jpsps/2023-12-01/label/jpsps_2023-12-01_lab-en.xml" xlink:role="http://www.xbrl.org/2003/role/labelLinkbaseRef" xlink:arcrole="http://www.w3.org/1999/xlink/properties/linkbase" />
+      <link:linkbaseRef xlink:type="simple" xlink:href="http://disclosure.edinet-fsa.go.jp/taxonomy/jpsps/2023-12-01/label/jpsps_2023-12-01_gla.xml" xlink:arcrole="http://www.w3.org/1999/xlink/properties/linkbase" />
+      <link:linkbaseRef xlink:type="simple" xlink:href="jpaud-aar-cn-001_E11348-000_2025-03-27_01_2025-06-27_pre.xml" xlink:role="http://www.xbrl.org/2003/role/presentationLinkbaseRef" xlink:arcrole="http://www.w3.org/1999/xlink/properties/linkbase" />
+    </appinfo>
+  </annotation>
+</schema>

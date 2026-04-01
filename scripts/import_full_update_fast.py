@@ -2,40 +2,47 @@
 # -*- coding: utf-8 -*-
 """
 マルチヘッダーパターン対応・上書き優先インポートスクリプト
+※検証用: 指定した特定のCSVファイルのみをインポートするように制限中
 
-fixed_csv_3/unit_million/ および fixed_csv_3/unit_yen/ 配下の全CSVを対象にインポート。
-- 財務数値: 1000倍を基本。値に「百万円」「億円」等が含まれる場合は単位に応じて計算
-- 強制上書き: transaction_type, sb_flag, nda_flag, ad_flag, latest_revenue, latest_profit, capital_stock
+設立列は csv.reader により常に文字列として受け取り、日付は backend.api.csv_founding_date で解釈する
+（数値推論なし）。pandas を使う場合は merge_pandas_dtype_str_for_founding を参照。
 """
 
 import csv
+import hashlib
 import json
 import logging
 import os
 import re
 import sys
-import uuid
+from datetime import date as date_type
 from decimal import Decimal
 from pathlib import Path
 
-import psycopg2
-from psycopg2.extras import execute_values
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+from backend.api.csv_founding_date import (
+    parse_birth_cell_to_date,
+    parse_founding_cell_to_date,
+    parse_year_from_founding_cell,
+)
 
-# 巨大CSVフィールド対応
+import psycopg2
+from psycopg2.extras import Json, execute_values
+
 csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
 
-# --- 設定 ---
 DB_HOST = os.getenv("POSTGRES_HOST", "34.84.189.233")
 DB_PORT = os.getenv("POSTGRES_PORT", "5432")
 DB_USER = os.getenv("POSTGRES_USER", "postgres")
-DB_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
+DB_PASSWORD = os.getenv("POSTGRES_PASSWORD") or os.getenv("PGPASSWORD") or ""
 DB_NAME = os.getenv("POSTGRES_DB", "postgres")
 DB_SSLMODE = os.getenv("POSTGRES_SSLMODE", "require")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("fast_importer")
 
-# 都道府県リスト（住所からの自動抽出用）
 PREFECTURES = (
     "北海道", "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県",
     "茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県",
@@ -46,218 +53,137 @@ PREFECTURES = (
     "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県",
 )
 
-# =============================================================================
-# カラムマッピングの網羅（Mapping Dictionary）
-# 基幹: name, corporate_number, transaction_type, sb_flag, nda_flag, ad_flag, is_active
-# 連絡先: postal_code, address, prefecture, phone_number, company_url
-# 財務: latest_revenue, latest_profit, capital_stock, employee_count, founded_year
-# 詳細: representative_name, executives, shareholders, banks, industries, overview, description
-# =============================================================================
 HEADER_MAP = {
-    # --- 基幹・管理フラグ（最優先）---
-    "法人番号": "corporate_number",
-    "ID": "corporate_number",
-    "会社ID": "corporate_number",
-    "リストID": "corporate_number",
-    "法人番号(先頭)": "corporate_number",
-    "会社名": "name",
-    "企業名": "name",
-    "商号又は名称": "name",
-    "商号又は名称かな": "kana",
-    "取引種別": "transaction_type",
-    "取引区分": "transaction_type",
-    "SBフラグ": "sb_flag",
-    "NDA": "nda_flag",
-    "AD": "ad_flag",
-    "状態": "status_for_active",
-    "ステータス": "status_for_active",
-    # --- 連絡先・所在地 ---
-    "郵便番号": "postal_code",
-    "会社郵便番号": "postal_code",
-    "営業所郵便番号": "postal_code",
-    "郵便番号(代表者用でない方)": "postal_code",
-    "住所": "address",
-    "会社住所": "address",
-    "所在地": "address",
-    "営業所所在地": "address",
-    "都道府県": "prefecture",
-    "電話番号": "phone_number",
-    "電話番号(窓口)": "phone_number",
-    "営業所電話番号": "phone_number",
-    "連絡先電話番号": "phone_number",
-    "FAX番号": "fax",
-    "メールアドレス": "email",
-    "URL": "company_url",
-    "企業ホームページURL": "company_url",
-    "お問い合わせURL": "company_url",
-    "website_url": "company_url",
-    # --- 財務・規模（100万倍対象）---
-    "直近売上": "latest_revenue",
-    "売上高": "latest_revenue",
-    "法人＿売上高": "latest_revenue",
-    "売上規模（百万円）": "latest_revenue",
-    "売上高1": "latest_revenue",
-    "売上高2": "latest_revenue",
-    "売上高3": "latest_revenue",
-    "売上高4": "latest_revenue",
-    "売上高5": "latest_revenue",
-    "直近利益": "latest_profit",
-    "法人＿当期純利益(損失)": "latest_profit",
-    "当期純利益(損失)": "latest_profit",
-    "経常利益": "latest_profit",
-    "営業利益": "latest_profit",
-    "利益1": "latest_profit",
-    "利益2": "latest_profit",
-    "利益3": "latest_profit",
-    "利益4": "latest_profit",
-    "利益5": "latest_profit",
-    "資本金": "capital_stock",
-    "法人＿資本金": "capital_stock",
-    "自己資本": "capital_stock",
-    "社員数": "employee_count",
-    "従業員数": "employee_count",
-    "合計＿計": "employee_count",
-    "[実績]": "employee_count",
-    "設立": "founding_year",
-    "創業": "founding_year",
-    "設立年月日": "founding_year",
-    "設立年月日(西暦)": "founding_year",
-    "区分": "listing",  # 区分ヘッダーの値は 上場/非上場
-    "上場": "listing",
-    "上場区分": "listing",
-    "上場区分（詳細）": "listing",
-    # --- 代表者・役員 ---
-    "代表者名": "representative_name",
-    "代表者": "representative_name",
-    "氏名1": "representative_name",
-    "代表者住所": "representative_home_address",
-    "代表者郵便番号": "representative_postal_code",
-    "代表者誕生日": "representative_birth_date",
-    "取締役": "executives",
-    "役員": "executives",
-    "役員名": "executives",
-    "株主": "shareholders",
-    "主要株主": "shareholders",
-    "株式保有率": "shareholders",
-    # --- 事業内容 ---
-    "業種": "industries",
-    "業種1": "industry_large",
-    "業種2": "industry_middle",
-    "業種3": "industry_small",
-    "業種4": "industry_detail",
-    "業種5": "industry_detail",
-    "業種6": "industry_detail",
-    "業種7": "industry_detail",
-    "業種-大": "industry_large",
-    "業種-中": "industry_middle",
-    "業種-小": "industry_small",
-    "業種-細": "industry_detail",
-    "業種（大）": "industry_large",
-    "業種（中）": "industry_middle",
-    "業種（小）": "industry_small",
-    "業種（細）": "industry_detail",
-    "ジャンル": "industry_large",
-    "営業種目": "industry_detail",
-    "概要": "overview",
-    "概況": "overview",
-    "説明": "overview",
-    "企業概要": "overview",
-    "事業内容": "overview",
-    "特意分野": "overview",
-    "会社情報・備考": "company_description",
-    "備考": "company_description",
-    "担当者コメント": "company_description",
-    "コメント": "company_description",
-    "仕入れ先": "suppliers",
-    "主要仕入先": "suppliers",
-    "取引先": "clients",
-    "主要取引先": "clients",
-    "[主な取引銀行]": "banks",
-    "取引先銀行": "banks",
-    "主要取引銀行": "banks",
-    "オフィス数": "office_count",
-    "[国内の事業所]": "office_count",
-    "工場数": "factory_count",
-    "店舗数": "store_count",
+    "法人番号": "corporate_number", "ID": "corporate_number", "会社ID": "corporate_number", "リストID": "corporate_number", "法人番号(先頭)": "corporate_number",
+    "会社名": "name", "企業名": "name", "商号又は名称": "name", "商号又は名称かな": "kana",
+    "取引種別": "transaction_type", "取引区分": "transaction_type",
+    "SBフラグ": "sb_flag", "NDA": "nda_flag", "NDA締結": "nda_flag", "ＮＤＡ": "nda_flag", "AD": "ad_flag",
+    "状態": "status_for_active", "ステータス": "status_for_active",
+    "郵便番号": "postal_code", "会社郵便番号": "postal_code", "営業所郵便番号": "postal_code", "郵便番号(代表者用でない方)": "postal_code",
+    "住所": "address", "会社住所": "address", "所在地": "address", "営業所所在地": "address", "都道府県": "prefecture",
+    "電話番号": "phone_number", "電話番号(窓口)": "phone_number", "営業所電話番号": "phone_number", "連絡先電話番号": "phone_number",
+    "FAX番号": "fax", "メールアドレス": "email",
+    "URL": "company_url", "企業ホームページURL": "company_url", "お問い合わせURL": "company_url", "website_url": "company_url",
+    "直近売上": "latest_revenue", "売上高": "latest_revenue", "法人＿売上高": "latest_revenue", "売上規模（百万円）": "latest_revenue",
+    "売上高1": "latest_revenue", "売上高2": "latest_revenue", "売上高3": "latest_revenue", "売上高4": "latest_revenue", "売上高5": "latest_revenue",
+    "直近決算年月": "latest_fiscal_year_month", "決算年月": "latest_fiscal_year_month", "最新決算年月": "latest_fiscal_year_month",
+    "直近利益": "latest_profit", "直近純利益": "latest_profit", "純利益": "latest_profit", "法人＿当期純利益(損失)": "latest_profit",
+    "当期純利益(損失)": "latest_profit", "経常利益": "latest_profit", "営業利益": "latest_profit",
+    "利益1": "latest_profit", "利益2": "latest_profit", "利益3": "latest_profit", "利益4": "latest_profit", "利益5": "latest_profit",
+    "資本金": "capital_stock", "法人＿資本金": "capital_stock", "自己資本": "capital_stock",
+    "社員数": "employee_count", "従業員数": "employee_count", "合計＿計": "employee_count", "[実績]": "employee_count",
+    "設立": "founding_year", "設立年月日": "founding_year", "設立年月日(西暦)": "founding_year", # 「創業」を削除（J列処理で事業詳細に回すため）
+    "区分": "listing", "上場": "listing", "上場区分": "listing", "上場区分（詳細）": "listing",
+    "代表者名": "representative_name", "代表者": "representative_name", "氏名1": "representative_name",
+    "代表者住所": "representative_home_address", "代表者郵便番号": "representative_postal_code", "代表者誕生日": "representative_birth_date",
+    "取締役": "executives", "役員": "executives", "役員名": "executives",
+    "株主": "shareholders", "主要株主": "shareholders", "株式保有率": "shareholders",
+    "業種": "industries", "業種1": "industry_large", "業種2": "industry_middle", "業種3": "industry_small", "業種4": "industry_detail",
+    "業種5": "industry_detail", "業種6": "industry_detail", "業種7": "industry_detail",
+    "業種-大": "industry_large", "業種-中": "industry_middle", "業種-小": "industry_small", "業種-細": "industry_detail",
+    "業種（大）": "industry_large", "業種（中）": "industry_middle", "業種（小）": "industry_small", "業種（細）": "industry_detail",
+    "ジャンル": "industry_large", "営業種目": "industry_detail",
+    "概要": "overview", "概況": "overview", "説明": "overview", "企業概要": "overview", "事業内容": "overview", "事業詳細": "business_summary", "特意分野": "overview",
+    "会社情報・備考": "company_description", "備考": "company_description", "担当者コメント": "company_description", "コメント": "company_description",
+    "仕入れ先": "suppliers", "仕入先": "suppliers", "主要仕入先": "suppliers", "主要仕入れ先": "suppliers",
+    "取引先": "clients", "主要取引先": "clients",
+    "[主な取引銀行]": "banks", "取引先銀行": "banks", "主要取引銀行": "banks",
+    "オフィス数": "office_count", "[国内の事業所]": "office_count",
+    "工場数": "factory_count", "店舗数": "store_count",
 }
 
-# --- DBカラム一覧（INSERT/UPDATE対象）---
-DB_COLS = sorted(
-    {
-        "name", "kana", "prefecture", "corporate_number", "transaction_type",
-        "sb_flag", "nda_flag", "ad_flag", "is_active",
-        "postal_code", "address", "phone_number", "fax", "email", "company_url",
-        "latest_revenue", "latest_profit", "capital_stock", "employee_count",
-        "founding_year", "listing",
-        "representative_name", "representative_home_address",
-        "representative_postal_code", "representative_birth_date",
-        "industry_large", "industry_middle", "industry_small", "industry_detail",
-        "overview", "company_description",
-        "executives", "shareholders", "suppliers", "clients", "banks", "industries",
-        "office_count", "factory_count", "store_count",
-    }
+DB_COLS = sorted({
+    "name", "kana", "prefecture", "corporate_number", "transaction_type",
+    "sb_flag", "nda_flag", "ad_flag", "is_active",
+    "postal_code", "address", "phone_number", "fax", "email", "company_url",
+    "latest_revenue", "latest_profit", "capital_stock", "employee_count",
+    "latest_fiscal_year_month",
+    "founding_year", "founding", "listing",
+    "representative_name", "representative_home_address",
+    "representative_postal_code", "representative_birth_date",
+    "industry_large", "industry_middle", "industry_small", "industry_detail",
+    "overview", "company_description", "business_summary",
+    "executives", "shareholders", "suppliers", "clients", "banks", "industries",
+    "office_count", "factory_count", "store_count",
+})
+
+_list_cols_jsonb = (
+    os.getenv("IMPORT_LIST_COLS_AS_JSONB", "").strip().lower() in ("1", "true", "yes")
+    or os.getenv("IMPORT_BANKS_AS_JSONB", "").strip().lower() in ("1", "true", "yes")
 )
-# 配列型カラム（TEXT[]/JSONB共通。PostgreSQLへは必ず Python list で渡す。文字列は不可）
-ARRAY_COLS = {"executives", "suppliers", "clients", "shareholders", "banks", "industries"}
+
+PG_TEXT_ARRAY_COLS_BASE = {"industries", "banks"}
+PG_TEXT_ARRAY_COLS = PG_TEXT_ARRAY_COLS_BASE | {"executives", "suppliers", "clients", "shareholders"} if not _list_cols_jsonb else PG_TEXT_ARRAY_COLS_BASE
+JSONB_LIST_COLS = {"executives", "suppliers", "clients", "shareholders"} if _list_cols_jsonb else set()
+ARRAY_COLS = PG_TEXT_ARRAY_COLS | JSONB_LIST_COLS
 INT_COLS = {"employee_count", "office_count", "factory_count", "store_count", "founding_year"}
 BOOL_COLS = {"sb_flag", "nda_flag", "ad_flag", "is_active"}
+DATE_COLS = {"founding", "representative_birth_date"}
 
-# 強制上書き対象：CSVの値で常に更新
-# 管理フラグ + 財務数値（データ修復モード：誤登録した巨大数値を正しい値で上書き）
-FORCE_OVERWRITE_COLS = {
-    "transaction_type", "sb_flag", "nda_flag", "ad_flag",
-    "latest_revenue", "latest_profit", "capital_stock",
-}
-
-# status_for_active は is_active 判定用の中間キー（DBには保存しない）
 HEADER_MAP_REV = None
 
-# =============================================================================
-# 2. インデックスベース抽出パターン
-# =============================================================================
-# パターン1: 文字化けファイル（6.csv〜32.csv）
-# 0:name, 1:prefecture, 3:corporate_number, 6:transaction_type, 8:nda_flag, 9:ad_flag,
-# 22:capital_stock, 25:latest_revenue, 26:latest_profit, 34:employee_count
 INDEX_COL_MAP_PATTERN1 = {
     0: "name", 1: "prefecture", 3: "corporate_number", 6: "transaction_type",
     8: "nda_flag", 9: "ad_flag", 22: "capital_stock", 25: "latest_revenue",
     26: "latest_profit", 34: "employee_count",
 }
 
-# yuzuri簡易型（グループI）: 4:区分（上場/非上場）-> listing, 5:売上規模（百万円）
+PATTERN1_38_COL_MAP = {
+    0: "name", 1: "prefecture", 2: "representative_name", 3: "corporate_number",
+    6: "transaction_type", 7: "status_for_active", 8: "nda_flag", 9: "ad_flag",
+    10: "company_description", 11: "company_url", 12: "industry_large",
+    13: "industry_middle", 14: "industry_small", 15: "postal_code",
+    16: "address", 17: "founding_year", 18: "phone_number",
+    19: "representative_postal_code", 20: "representative_home_address",
+    21: "representative_birth_date", 22: "capital_stock", 23: "listing",
+    24: "latest_fiscal_year_month", 25: "latest_revenue", 26: "latest_profit",
+    27: "overview", 28: "overview", 29: "suppliers", 30: "clients",
+    31: "banks", 32: "executives", 33: "shareholders", 34: "employee_count",
+    35: "office_count", 36: "factory_count", 37: "store_count",
+}
+
 YUZURI_INDEX_MAP = {
     0: "name", 1: "address", 2: "representative_name", 3: "industry_large",
     4: "listing", 5: "latest_revenue", 6: "overview",
 }
 
-# 財務詳細（5.csv）: 32:売上高, 45:当期純利益, 25:資本金
 PATTERN_5_CSV_MAP = {
     32: "latest_revenue", 45: "latest_profit", 25: "capital_stock",
 }
 
+IMPORT_FIRSTTIME_INDEX_MAP_BASE = {
+    0: "name", 1: "phone_number", 2: "postal_code", 3: "address",
+    4: "company_url", 5: "representative_name", 6: "representative_postal_code",
+    7: "representative_home_address", 11: "shareholders", 12: "executives",
+    13: "overview", 14: "industry_large", 15: "industry_detail",
+    16: "industry_middle", 17: "industry_small",
+}
+
+def import_firsttime_founding_column_index(headers) -> int:
+    target = normalize_header("設立")
+    for i, h in enumerate(headers or []):
+        if normalize_header(h) == target:
+            return i
+    return 10
+
+def build_import_firsttime_index_map(headers) -> dict:
+    m = dict(IMPORT_FIRSTTIME_INDEX_MAP_BASE)
+    m[import_firsttime_founding_column_index(headers)] = "founding_year"
+    return m
+
 cache_corp = {}
 cache_name_pref = {}
 
-
 def load_id_caches(conn):
-    """法人番号・名前+都道府県のインメモリキャッシュを構築"""
-    logger.info("名寄せキャッシュを構築中... (500万件超のロードには数分かかります)")
+    logger.info("名寄せキャッシュを構築中...")
     cur = conn.cursor()
-    cur.execute(
-        "SELECT corporate_number, id FROM companies WHERE corporate_number IS NOT NULL"
-    )
+    cur.execute("SELECT corporate_number, id FROM companies WHERE corporate_number IS NOT NULL")
     global cache_corp
     cache_corp = dict(cur.fetchall())
-    cur.execute(
-        "SELECT name, prefecture, id FROM companies WHERE name IS NOT NULL AND prefecture IS NOT NULL"
-    )
+    cur.execute("SELECT name, COALESCE(NULLIF(TRIM(prefecture), ''), '') AS pref, id FROM companies WHERE name IS NOT NULL")
     global cache_name_pref
     cache_name_pref = {(r[0], r[1]): r[2] for r in cur.fetchall()}
-    logger.info(
-        f"キャッシュ完了: 法人番号 {len(cache_corp)}件, 名前+都道府県 {len(cache_name_pref)}件"
-    )
     cur.close()
-
 
 def get_encoding(file_path):
     for enc in ["utf-8-sig", "cp932", "utf-8"]:
@@ -269,56 +195,40 @@ def get_encoding(file_path):
             continue
     return "utf-8"
 
-
 def normalize_header(raw):
-    """ヘッダー正規化（全角・改行・空白除去）"""
-    if not raw:
-        return ""
+    if not raw: return ""
     s = str(raw).strip().strip("\ufeff").replace("\n", " ").replace("\r", " ")
     s = s.replace("　", " ").replace("（", "(").replace("）", ")")
     return re.sub(r"\s+", "", s)
 
-
 def _build_header_map_reverse():
-    """DBカラム -> [正規化済みCSV項目名...] の逆引き"""
     rev = {}
     for csv_h, db_col in HEADER_MAP.items():
-        if db_col == "status_for_active":
-            continue
+        if db_col == "status_for_active": continue
         n = normalize_header(csv_h)
-        if db_col not in rev:
-            rev[db_col] = []
-        if n and n not in rev[db_col]:
-            rev[db_col].append(n)
+        if db_col not in rev: rev[db_col] = []
+        if n and n not in rev[db_col]: rev[db_col].append(n)
     return rev
 
-
 def normalize_val(val):
-    if val is None:
-        return None
+    if val is None: return None
     s = str(val).strip()
     return s if s.lower() not in ["", "nan", "none", "null"] else None
 
+def is_blank_csv_cell(val) -> bool:
+    if val is None: return True
+    if isinstance(val, (int, float)) and not isinstance(val, bool): return False
+    s = str(val).strip()
+    if not s: return True
+    return s.lower() in ("nan", "none", "null")
 
 def normalize_array_value(val):
-    """
-    配列型データを正規化。必ず Python list または None を返す。
-    文字列 ["\\u98ef..."] は json.loads() で list に変換（Unicodeデコード済み）。
-    文字列のまま psycopg2 に渡すと InvalidTextRepresentation が発生する。
-    """
-    if val is None:
-        return None
+    if val is None: return None
     s = str(val).strip()
-    if not s or s in ("[]", "nan", "none", "null") or s.lower() in ("nan", "none", "null"):
-        return None
-
-    # CSV囲み引用符を除去（繰り返し適用）
+    if not s or s in ("[]", "nan", "none", "null") or s.lower() in ("nan", "none", "null"): return None
     while len(s) >= 2 and ((s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")):
         s = s[1:-1].strip()
-        if not s:
-            return None
-
-    # [ で始まり ] で終わる場合：json.loads で list に変換
+        if not s: return None
     if s.startswith("[") and s.endswith("]"):
         try:
             lst = json.loads(s)
@@ -326,9 +236,7 @@ def normalize_array_value(val):
                 result = [str(x).strip() for x in lst if x is not None and str(x).strip()]
                 return result if result else None
             return None
-        except (json.JSONDecodeError, TypeError):
-            pass
-        # 失敗時：[...] の部分を抽出して再試行
+        except (json.JSONDecodeError, TypeError): pass
         m = re.search(r"\[.*\]", s, re.DOTALL)
         if m:
             try:
@@ -336,16 +244,22 @@ def normalize_array_value(val):
                 if isinstance(lst, list):
                     result = [str(x).strip() for x in lst if x is not None and str(x).strip()]
                     return result if result else None
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-    # カンマ区切り
+            except (json.JSONDecodeError, TypeError): pass
+    for sep in ("\n", "、", "，", ";", "；"):
+        s = s.replace(sep, ",")
     result = [x.strip() for x in s.split(",") if x.strip()]
     return result if result else None
 
+def _unwrap_json_array_string_list(val):
+    if not isinstance(val, list) or len(val) != 1: return val
+    s = val[0]
+    if not isinstance(s, str): return val
+    t = s.strip()
+    if not (t.startswith("[") and t.endswith("]")): return val
+    inner = normalize_array_value(s)
+    return inner if inner is not None else val
 
 def resolve_current_map(headers):
-    """ヘッダーからDBカラムへのマッピング（正規化ヘッダー＋生ヘッダー）"""
     global HEADER_MAP_REV
     if HEADER_MAP_REV is None:
         HEADER_MAP_REV = _build_header_map_reverse()
@@ -361,27 +275,15 @@ def resolve_current_map(headers):
             current[i] = HEADER_MAP[h.strip()]
     return current
 
-
-# すべての計算終了後の物理限界（900京超は必ず None）
 BIGINT_SAFE_MAX = 9_000_000_000_000_000_000
-INPUT_CAP = 100_000_000_000_000  # 入力の異常値上限
+INPUT_CAP = 100_000_000_000_000
 
-
-def parse_revenue_profit(val, file_path=None, apply_1000x=True):
-    """
-    財務数値のパース。多重変換防止: 「百万円」「億円」等がある場合は
-    その単位のみ適用し、1000倍は絶対に適用しない。
-    """
-    if not val or str(val).lower() == "nan":
-        return None
+def parse_revenue_profit(val, file_path=None, revenue_folder="unit_yen"):
+    if not val or str(val).lower() == "nan": return None
     s_val = str(val).replace(",", "").strip().replace("　", "").replace(" ", "")
-    if not s_val:
-        return None
-
+    if not s_val: return None
     unit_factor = 1
     has_unit = False
-
-    # 単位の判定（百万円・億円がある場合は 1000倍 は適用しない）
     if "億円" in s_val or "億" in s_val:
         unit_factor = 100_000_000
         s_val = re.sub(r"億円?|円", "", s_val)
@@ -394,186 +296,220 @@ def parse_revenue_profit(val, file_path=None, apply_1000x=True):
         unit_factor = 10_000
         s_val = re.sub(r"万円?|円", "", s_val)
         has_unit = True
-
     try:
         num_part = re.sub(r"[^\d\.\-eE+]", "", s_val)
-        if not num_part:
-            return None
+        if not num_part: return None
         f_val = float(num_part)
-        if abs(f_val) > INPUT_CAP:
-            return None
-
-        # 単位指定がある場合はそれのみ、ない場合のみ 1000倍
-        final_factor = unit_factor if has_unit else (1000 if apply_1000x else 1)
+        if abs(f_val) > INPUT_CAP: return None
+        if has_unit:
+            final_factor = unit_factor
+        elif revenue_folder == "unit_million":
+            final_factor = 1_000_000
+        else:
+            final_factor = 1000
         result = int(f_val * final_factor)
-
-        # 【最終防衛線】すべての倍率計算が終わった直後に必ずチェック
-        if abs(result) > BIGINT_SAFE_MAX:
-            return None
+        if abs(result) > BIGINT_SAFE_MAX: return None
         return result
-    except Exception:
-        return None
+    except Exception: return None
 
+def parse_capital_stock(val, file_path=None):
+    return parse_revenue_profit(val, file_path=file_path, revenue_folder="unit_yen")
 
-# エイリアス（parse_financial_value 相当）
 parse_financial_value = parse_revenue_profit
 
-
 def parse_int_safe(val):
-    """整数化（7.0 -> 7）"""
     s = normalize_val(val)
-    if not s:
-        return None
+    if not s: return None
     s = re.sub(r"[^\d\.\-]", "", s)
-    try:
-        return int(float(s))
-    except (ValueError, OverflowError):
-        return None
-
+    try: return int(float(s))
+    except (ValueError, OverflowError): return None
 
 def parse_bool(val):
-    """○、1、あり、Trueなどの値をTrueに、それ以外をFalseに変換"""
     s = normalize_val(val)
-    if not s:
-        return None
+    if not s: return None
     s_lower = s.lower()
-    if s_lower in ("1", "true", "yes", "y", "○", "〇", "あり", "済"):
-        return True
+    if "未締結" in s_lower or "未契約" in s_lower: return False
+    if s_lower in ("1", "true", "yes", "y", "○", "〇", "あり", "済"): return True
+    if "締結済" in s_lower or "契約済" in s_lower or "済み" in s_lower: return True
+    if "締結" in s_lower and "未" not in s_lower: return True
     return False
 
-
 def parse_year(val):
-    """文字列から最初の4桁（西暦）を抽出して整数で返す"""
     s = normalize_val(val)
-    if not s:
-        return None
+    if not s: return None
+    if re.fullmatch(r"\d{5,}", s): return None
     match = re.search(r"(\d{4})", s)
     return int(match.group(1)) if match else None
 
+# 設立・誕生日のパースは backend.api.csv_founding_date（Excel シリアルを設立に使わない）
+
+def normalize_latest_fiscal(val):
+    s = normalize_val(val)
+    if not s: return None
+    # 「2023年8月1日」等から年月だけを抽出して保存
+    m = re.search(r"(\d{4})年(\d{1,2})月", s)
+    if m:
+        return f"{m.group(1)}年{m.group(2)}月"
+    return s[:10] if len(s) > 10 else s
+
+def prefecture_key_for_row(row: dict) -> str:
+    p = row.get("prefecture") or extract_prefecture(row.get("address")) or ""
+    return (p or "").strip()
+
+def deterministic_id_name_pref(name: str, pref: str) -> str:
+    raw = f"{(name or '').strip()}\x00{(pref or '').strip()}"
+    h = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return f"np{h[:32]}"
+
+def postal_jp_ok(p: str) -> bool:
+    if not p: return True
+    return bool(re.match(r"^\d{3}-\d{4}$", p) or (len(re.sub(r"\D", "", p)) == 7))
+
+def should_skip_corrupt_row(row: list[str], headers: list[str], file_pattern: str, lineno: int, rel_path: str) -> tuple[bool, str]:
+    if len(row) != len(headers): return True, "column_count_mismatch"
+    for i, h in enumerate(headers):
+        if h.strip() == "法人番号":
+            if i < len(row):
+                cn = normalize_val(row[i])
+                if cn and normalize_corp_num(cn) is None: return True, "invalid_corporate_number"
+            break
+    if file_pattern not in ("import_firsttime", "pattern1", "pattern1_38", "yuzuri", "pattern_5"):
+        for i, h in enumerate(headers):
+            if h.strip() == "郵便番号" and i < len(row):
+                p = normalize_val(row[i])
+                if p and (not postal_jp_ok(p)) and len(p) > 15 and any(x in p for x in ("県", "都", "府", "市", "区", "町", "村", "丁目")):
+                    return True, "postal_field_looks_like_address"
+                break
+    return False, ""
+
+def append_import_skip_log(rel_path: str, lineno: int, reason: str, snippet: str):
+    env_log = os.getenv("IMPORT_SKIP_LOG")
+    if env_log: log_path = Path(env_log)
+    else:
+        script_dir = Path(__file__).resolve().parent
+        log_path = script_dir.parent / "reports" / "import_skip_log.jsonl"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        rec = json.dumps({"file": rel_path, "line": lineno, "reason": reason, "snippet": snippet[:200]}, ensure_ascii=False)
+        with open(log_path, "a", encoding="utf-8") as lf: lf.write(rec + "\n")
+    except OSError as e: logger.warning(f"スキップログ書き込み失敗: {e}")
 
 def is_active_logic(status):
-    """状態・ステータス列に「解散」「廃業」「休止」「清算」が含まれる場合はFalse、それ以外はTrue"""
     s = normalize_val(status)
-    if not s:
-        return None
+    if not s: return None
     s_lower = s.lower()
-    if any(kw in s_lower for kw in ("解散", "廃業", "休止", "清算")):
-        return False
+    if any(kw in s_lower for kw in ("解散", "廃業", "休止", "清算")): return False
     return True
 
-
 def extract_prefecture(address):
-    """都道府県列が空の場合、住所文字列の先頭から都道府県を抽出する"""
-    if not address:
-        return None
+    if not address: return None
     s = str(address).strip()
     for pref in PREFECTURES:
-        if pref in s:
-            return pref
+        if pref in s: return pref
     return None
 
-
-# transaction_type の期待キーワード（これらを含む値は有効とみなす）
 TRANSACTION_TYPE_KEYWORDS = ("譲受", "譲渡", "提携")
 
-
 def cleanse_transaction_type(val):
-    """
-    transaction_type の文字化け除去。
-    - 置換文字(U+FFFD)・不正バイト列を除去
-    - 期待キーワード（譲受・譲渡・提携）を含まない、または記号のみの場合は '未設定' を返す
-    """
-    if val is None:
-        return None
+    if val is None: return None
     s = str(val).strip()
-    if not s or s.lower() in ("nan", "none", "null"):
-        return None
-    # 置換文字除去
+    if not s or s.lower() in ("nan", "none", "null"): return None
     s = s.replace("\ufffd", "")
-    # cp932 で再エンコードして不正バイトを除去
-    try:
-        s = s.encode("cp932", errors="ignore").decode("cp932")
-    except Exception:
-        pass
+    try: s = s.encode("cp932", errors="ignore").decode("cp932")
+    except Exception: pass
     s = s.strip()
-    if not s:
-        return "未設定"
-    # 期待キーワードを含まない場合は '未設定'
-    if not any(kw in s for kw in TRANSACTION_TYPE_KEYWORDS):
-        return "未設定"
-    # 記号のみ（漢字・かな・英字が残っていない）の場合は '未設定'
+    if not s: return "未設定"
+    if not any(kw in s for kw in TRANSACTION_TYPE_KEYWORDS): return "未設定"
     meaningful = re.sub(r"[^\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ffa-zA-Z]", "", s)
-    if not meaningful:
-        return "未設定"
+    if not meaningful: return "未設定"
     return s
 
-
 def normalize_corp_num(val):
-    """指数表記（E+）を解除し、13桁の文字列として正規化する"""
-    if val is None:
-        return None
+    if val is None: return None
     s = str(val).strip()
-    if not s or s.lower() in ["nan", "none", "null"]:
-        return None
+    if not s or s.lower() in ["nan", "none", "null"]: return None
     if "e" in s.lower():
         try:
             d = Decimal(s)
             s = str(int(d))
         except Exception:
-            try:
-                s = f"{float(s):.0f}"
-            except Exception:
-                return None
+            try: s = f"{float(s):.0f}"
+            except Exception: return None
     s = re.sub(r"[^\d]", "", s)
-    if len(s) == 12:
-        s = "0" + s
+    if len(s) == 12: s = "0" + s
     return s if len(s) == 13 and s.isdigit() else None
 
-
-
-
 def detect_file_pattern(file_path, headers, col_map):
-    """ファイルパターン判定: yuzuri / 5.csv / 文字化け"""
     name = file_path.name.lower()
-    if "yuzuri" in name or detect_yuzuri_type(headers):
-        return "yuzuri"
-    if name == "5.csv" or "5.fixed" in name:
-        return "pattern_5"
+    if "import_firsttime" in name: return "import_firsttime"
+    if "yuzuri" in name or detect_yuzuri_type(headers): return "yuzuri"
+    if name == "5.csv" or "5.fixed" in name: return "pattern_5"
     if len(col_map) < 4 and len(headers) >= 30:
+        if len(headers) == 38: return "pattern1_38"
         return "pattern1"
     return "normal"
 
-
 def detect_yuzuri_type(headers):
-    """「売上規模（百万円）」を検知"""
     for h in headers or []:
         n = normalize_header(h)
-        if "売上規模" in n and "百万円" in n:
-            return True
+        if "売上規模" in n and "百万円" in n: return True
     return False
 
+def resolve_row_name_for_log(row, col_map, use_index, index_map):
+    """設立パース失敗ログ用の会社名（取れるときだけ）。"""
+    if use_index and row is not None and index_map.get(0) == "name" and len(row) > 0:
+        return normalize_val(row[0])
+    for idx, dcol in sorted(col_map.items()):
+        if dcol == "name" and idx < len(row):
+            return normalize_val(row[idx])
+    return None
 
-def apply_value(data, db_col, raw_val, file_path=None):
-    """1カラム分の値をパースして data にセット"""
+def apply_value(data, db_col, raw_val, file_path=None, revenue_folder="unit_yen", log_context=None):
     if db_col == "status_for_active":
         data["is_active"] = is_active_logic(raw_val)
         return
-    if db_col in ["latest_revenue", "latest_profit", "capital_stock"]:
-        if not raw_val:
-            data[db_col] = None
-        else:
-            data[db_col] = parse_revenue_profit(raw_val, file_path=file_path)
+    if db_col in ["latest_revenue", "latest_profit"]:
+        if is_blank_csv_cell(raw_val): return
+        parsed = parse_revenue_profit(raw_val, file_path=file_path, revenue_folder=revenue_folder)
+        if parsed is not None: data[db_col] = parsed
+        return
+    if db_col == "capital_stock":
+        if is_blank_csv_cell(raw_val): return
+        parsed = parse_capital_stock(raw_val, file_path=file_path)
+        if parsed is not None: data[db_col] = parsed
+        return
     elif db_col == "corporate_number":
         data[db_col] = normalize_corp_num(raw_val)
+    elif db_col == "latest_fiscal_year_month":
+        data[db_col] = normalize_latest_fiscal(raw_val)
+    elif db_col == "representative_birth_date":
+        data[db_col] = parse_birth_cell_to_date(raw_val)
+    elif db_col == "founding_year":
+        if is_blank_csv_cell(raw_val):
+            return
+        d = parse_founding_cell_to_date(raw_val)
+        if d:
+            data["founding"] = d
+            data["founding_year"] = d.year
+        else:
+            y = parse_year_from_founding_cell(raw_val) or parse_year(raw_val)
+            if y is not None:
+                data["founding_year"] = y
+            elif log_context and log_context.get("lineno") is not None:
+                raw_s = normalize_val(raw_val)
+                if raw_s:
+                    logger.warning(
+                        "設立日をパースできずスキップ（日付・年とも取れず）: path=%s line=%s company=%r value=%r",
+                        log_context.get("rel_path"),
+                        log_context["lineno"],
+                        log_context.get("name"),
+                        raw_s,
+                    )
     elif db_col in INT_COLS:
         data[db_col] = parse_int_safe(raw_val)
     elif db_col in BOOL_COLS:
-        if db_col == "is_active":
-            data[db_col] = is_active_logic(raw_val)
-        else:
-            data[db_col] = parse_bool(raw_val)
-    elif db_col == "founding_year":
-        data[db_col] = parse_year(raw_val)
+        if db_col == "is_active": data[db_col] = is_active_logic(raw_val)
+        else: data[db_col] = parse_bool(raw_val)
     elif db_col in ARRAY_COLS:
         data[db_col] = normalize_array_value(raw_val)
     elif db_col == "transaction_type":
@@ -583,201 +519,174 @@ def apply_value(data, db_col, raw_val, file_path=None):
     else:
         data[db_col] = normalize_val(raw_val)
 
-
-def apply_yuzuri_value(data, db_col, raw_val, file_path=None):
-    """yuzuri型: 数値パースは parse_revenue_profit に委譲"""
-    apply_value(data, db_col, raw_val, file_path=file_path)
-
+def apply_yuzuri_value(data, db_col, raw_val, file_path=None, revenue_folder="unit_yen", log_context=None):
+    apply_value(data, db_col, raw_val, file_path=file_path, revenue_folder=revenue_folder, log_context=log_context)
 
 def upsert_batch(conn, batch):
-    """
-    二段構えの名寄せ + カラム別更新ルール。
-    - 強制上書き（transaction_type, sb_flag, nda_flag, ad_flag）: 常にCSVの値で更新
-    - 条件付き更新（その他）: DBがNULLの場合のみCSVの値を補完
-    新規企業は INSERT。バッチ内の重複は後勝ちで排除。
-    """
     cur = conn.cursor()
-
     for row in batch:
         row["id"] = None
-        if row.get("corporate_number"):
-            row["id"] = cache_corp.get(row["corporate_number"])
-        if not row["id"] and row.get("name"):
-            pref = row.get("prefecture") or extract_prefecture(row.get("address"))
-            if pref:
-                row["id"] = cache_name_pref.get((row["name"], pref))
-            if not row["id"] and row.get("prefecture"):
-                row["id"] = cache_name_pref.get((row["name"], row["prefecture"]))
-
+        if row.get("corporate_number"): row["id"] = cache_corp.get(row["corporate_number"])
+        pref_k = prefecture_key_for_row(row)
+        if not row["id"] and row.get("name"): row["id"] = cache_name_pref.get((row["name"], pref_k))
     update_map = {}
     insert_map = {}
     for row in batch:
-        if row["id"]:
-            update_map[row["id"]] = row
+        if row["id"]: update_map[row["id"]] = row
         else:
-            key = (row.get("name") or "", row.get("prefecture") or "")
-            if key[0]:
-                insert_map[key] = row
-
+            nm = row.get("name") or ""
+            key = (nm, prefecture_key_for_row(row))
+            if nm: insert_map[key] = row
     updates = list(update_map.values())
     inserts = list(insert_map.values())
-
     cols_to_update = [c for c in DB_COLS if c not in ("corporate_number", "status_for_active")]
-    # 強制上書き: EXCLUDED をそのまま代入 / 条件付き: COALESCE(companies.col, EXCLUDED.col)
-    set_clauses = []
-    for c in cols_to_update:
-        if c in FORCE_OVERWRITE_COLS:
-            set_clauses.append(f"{c} = EXCLUDED.{c}")
-        else:
-            set_clauses.append(f"{c} = COALESCE(companies.{c}, EXCLUDED.{c})")
+    set_clauses = [f"{c} = COALESCE(EXCLUDED.{c}, companies.{c})" for c in cols_to_update]
     set_clauses.append("updated_at = NOW()")
 
     def _normalize_row_arrays(row):
-        """配列型カラムをバッチ処理直前に正規化（文字列→list、[ ] を除去）"""
         for col in ARRAY_COLS:
             v = row.get(col)
-            if v is not None and not isinstance(v, list):
-                row[col] = normalize_array_value(v)
+            if v is not None and not isinstance(v, list): row[col] = normalize_array_value(v)
+            elif v is not None and col in PG_TEXT_ARRAY_COLS: row[col] = _unwrap_json_array_string_list(v)
         return row
 
     def _wrap_val(v, col):
-        """配列型は必ず Python list または None で渡す。文字列は絶対に渡さない。"""
-        if col in ARRAY_COLS:
-            if v is None:
-                return None
-            if isinstance(v, list):
-                return v
-            # 文字列の場合は必ず json.loads 等で list に変換
+        if col in JSONB_LIST_COLS:
+            if v is None: return None
+            if isinstance(v, list): return Json(v) if v else None
             normalized = normalize_array_value(v)
-            return normalized  # list or None
+            return Json(normalized) if normalized else None
+        if col in PG_TEXT_ARRAY_COLS:
+            if v is None: return None
+            if isinstance(v, list): return _unwrap_json_array_string_list(v)
+            normalized = normalize_array_value(v)
+            return normalized
+        if col in DATE_COLS: return v
         return v
 
-    # 配列型の最終正規化（文字列が残っていないことを保証）
-    for r in updates:
-        _normalize_row_arrays(r)
-    for r in inserts:
-        _normalize_row_arrays(r)
+    for r in updates: _normalize_row_arrays(r)
+    for r in inserts: _normalize_row_arrays(r)
 
     if updates:
-        vals = [
-            [r["id"]] + [_wrap_val(r.get(c), c) for c in cols_to_update]
-            for r in updates
-        ]
-        query = f"""INSERT INTO companies (id, {", ".join(cols_to_update)})
-            VALUES %s
-            ON CONFLICT (id) DO UPDATE SET {", ".join(set_clauses)}"""
+        vals = [[r["id"]] + [_wrap_val(r.get(c), c) for c in cols_to_update] for r in updates]
+        query = f"""INSERT INTO companies (id, {", ".join(cols_to_update)}) VALUES %s ON CONFLICT (id) DO UPDATE SET {", ".join(set_clauses)}"""
         execute_values(cur, query, vals)
-
     if inserts:
         for row in inserts:
-            row["id"] = row.get("corporate_number") or str(uuid.uuid4())
+            if row.get("corporate_number"): row["id"] = row["corporate_number"]
+            else: row["id"] = deterministic_id_name_pref(row.get("name") or "", prefecture_key_for_row(row))
         insert_cols = ["id"] + cols_to_update
-        vals = [
-            [r["id"]] + [_wrap_val(r.get(c), c) for c in cols_to_update]
-            for r in inserts
-        ]
-        query = f"""INSERT INTO companies ({", ".join(insert_cols)})
-            VALUES %s
-            ON CONFLICT (id) DO UPDATE SET {", ".join(set_clauses)}"""
+        vals = [[r["id"]] + [_wrap_val(r.get(c), c) for c in cols_to_update] for r in inserts]
+        query = f"""INSERT INTO companies ({", ".join(insert_cols)}) VALUES %s ON CONFLICT (id) DO UPDATE SET {", ".join(set_clauses)}"""
         execute_values(cur, query, vals)
-
+    for r in list(update_map.values()) + inserts:
+        rid = r.get("id")
+        if not rid: continue
+        cn = r.get("corporate_number")
+        if cn: cache_corp[cn] = rid
+        if r.get("name"): cache_name_pref[(r["name"], prefecture_key_for_row(r))] = rid
     conn.commit()
     cur.close()
-
 
 def process_file(conn, file_path):
     enc = get_encoding(file_path)
     rel_path = f"{file_path.parent.name}/{file_path.name}"
-    logger.info(f"処理開始: {rel_path} [財務: 1000倍+単位文字列対応]")
+    revenue_folder = "unit_million" if file_path.parent.name == "unit_million" else "unit_yen"
+    logger.info(f"処理開始: {rel_path} [財務スケール: {revenue_folder}]")
     with open(file_path, "r", encoding=enc, errors="replace") as f:
         reader = csv.reader(f)
         headers = next(reader, None)
-        if not headers:
-            return
-
+        if not headers: return
         col_map = resolve_current_map(headers)
         file_pattern = detect_file_pattern(file_path, headers, col_map)
 
-        if file_pattern == "pattern1":
-            logger.info(f"  インデックスベース抽出（パターン1・38列）")
-        elif file_pattern == "yuzuri":
-            logger.info(f"  yuzuri簡易型")
-        elif file_pattern == "pattern_5":
-            logger.info(f"  財務詳細（5.csv）")
-
         index_map = INDEX_COL_MAP_PATTERN1
-        if file_pattern == "yuzuri":
-            index_map = YUZURI_INDEX_MAP
-        elif file_pattern == "pattern_5":
-            index_map = PATTERN_5_CSV_MAP
+        if file_pattern == "pattern1_38": index_map = PATTERN1_38_COL_MAP
+        elif file_pattern == "yuzuri": index_map = YUZURI_INDEX_MAP
+        elif file_pattern == "pattern_5": index_map = PATTERN_5_CSV_MAP
+        elif file_pattern == "import_firsttime": index_map = build_import_firsttime_index_map(headers)
 
-        use_index = file_pattern in ("pattern1", "yuzuri")
+        use_index = file_pattern in ("pattern1", "pattern1_38", "yuzuri", "import_firsttime")
         use_pattern5 = file_pattern == "pattern_5"
 
         batch = []
-        for row in reader:
-            if len(row) < 2:
+        for lineno, row in enumerate(reader, start=2):
+            if len(row) < 2: continue
+            skip, skip_reason = should_skip_corrupt_row(row, headers, file_pattern, lineno, rel_path)
+            if skip:
+                append_import_skip_log(rel_path, lineno, skip_reason, row[0] if row else "")
                 continue
+
             data = {c: None for c in DB_COLS}
             data["status_for_active"] = None
+            log_ctx = {
+                "rel_path": rel_path,
+                "lineno": lineno,
+                "name": resolve_row_name_for_log(row, col_map, use_index, index_map),
+            }
 
             if use_index:
                 for idx, db_col in index_map.items():
                     if idx < len(row):
-                        if file_pattern == "yuzuri":
-                            apply_yuzuri_value(data, db_col, row[idx], file_path)
-                        else:
-                            apply_value(data, db_col, row[idx], file_path)
+                        if file_pattern == "yuzuri": apply_yuzuri_value(data, db_col, row[idx], file_path, revenue_folder, log_ctx)
+                        else: apply_value(data, db_col, row[idx], file_path, revenue_folder, log_ctx)
             else:
                 for col_idx, db_col in col_map.items():
                     if col_idx < len(row):
-                        apply_value(data, db_col, row[col_idx], file_path)
+                        apply_value(data, db_col, row[col_idx], file_path, revenue_folder, log_ctx)
+
+            if file_pattern == "pattern1_38" and len(row) > 28:
+                bits = []
+                for i in (27, 28):
+                    if i < len(row):
+                        v = normalize_val(row[i])
+                        if v: bits.append(v)
+                if bits: data["overview"] = "\n\n".join(bits)
 
             if use_pattern5:
                 for idx, db_col in PATTERN_5_CSV_MAP.items():
                     if idx < len(row) and row[idx]:
-                        apply_value(data, db_col, row[idx], file_path)
+                        apply_value(data, db_col, row[idx], file_path, revenue_folder, log_ctx)
+
+            if file_pattern == "import_firsttime":
+                sogy = normalize_val(row[8]) if len(row) > 8 else None
+                biz_mix = normalize_val(row[9]) if len(row) > 9 else None
+                base_bs = (data.get("business_summary") or "").strip()
+                if not base_bs: base_bs = (data.get("overview") or "").strip()
+                chunks = [base_bs] if base_bs else []
+                if sogy: chunks.append(f"【創業】{sogy}")
+                if biz_mix: chunks.append(f"【事業構成】{biz_mix}")
+                if sogy or biz_mix or (base_bs and len(chunks) > 1):
+                    data["business_summary"] = "\n\n".join(x for x in chunks if x) or None
 
             if not data.get("prefecture") and data.get("address"):
                 data["prefecture"] = extract_prefecture(data["address"])
 
-            if data.get("name"):
-                batch.append(data)
-
+            if data.get("name"): batch.append(data)
             if len(batch) >= 1000:
                 upsert_batch(conn, batch)
                 batch = []
-
-        if batch:
-            upsert_batch(conn, batch)
-
+        if batch: upsert_batch(conn, batch)
 
 def main():
-    # スクリプト位置基準で fixed_csv_3 を解決（cwd に依存しない）
     script_dir = Path(__file__).resolve().parent
     project_root = script_dir.parent
     target_dir = project_root / "fixed_csv_3"
-    if not target_dir.exists():
-        logger.error(f"ディレクトリが存在しません: {target_dir}")
-        sys.exit(1)
-    # fixed_csv_3 直下や later フォルダを無視し、unit_million / unit_yen のみ対象
-    sub_dirs = ["unit_million", "unit_yen"]
-    csv_files = []
-    for sub in sub_dirs:
-        target_path = target_dir / sub
-        if target_path.exists():
-            csv_files.extend(target_path.glob("*.csv"))
-    csv_files = sorted(csv_files)
-    logger.info(f"対象CSV: {len(csv_files)}件")
-    logger.info("管理フラグ(sb_flag, nda_flag, ad_flag)を使用する場合は backend/sql/add_management_flags.sql を事前実行してください")
+    
+    # ■■■ 対象ファイルを「タイプ1」など検証したい特定のCSVだけに絞り込む ■■■
+    # ※今回は日付バグ・設立修正の確認と、タイプ1（10.csvなど）の確認を安全に行うため、以下のファイルのみ実行
+    target_files = [
+        target_dir / "unit_yen" / "10.csv",
+        target_dir / "unit_million" / "1.csv",
+        target_dir / "unit_yen" / "import_firstTime_105.csv",
+        target_dir / "unit_million" / "import_firstTime_1.csv"
+    ]
+    
+    csv_files = [fp for fp in target_files if fp.exists()]
+    logger.info(f"対象CSVを {len(csv_files)} 件に制限して実行します。")
 
     conn = psycopg2.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        dbname=DB_NAME,
-        sslmode=DB_SSLMODE,
+        host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, dbname=DB_NAME, sslmode=DB_SSLMODE
     )
     try:
         load_id_caches(conn)
@@ -785,9 +694,6 @@ def main():
             process_file(conn, fp)
     finally:
         conn.close()
-
-    logger.info("インポート完了")
-
 
 if __name__ == "__main__":
     main()

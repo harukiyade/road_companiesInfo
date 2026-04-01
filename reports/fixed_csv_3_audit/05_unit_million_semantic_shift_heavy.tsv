@@ -1,0 +1,8 @@
+file	line	flags	法人番号	会社名
+111.fixed.csv	1977	phone_suspicious	4.33E+12	山都酒造株式会社
+12_20251224.csv	2037	listed_suspicious	2021001033448	株式会社典
+32.csv	1249	phone_suspicious	5122001030307	株式会社CROSLAN
+4.csv	1393	phone_suspicious,listed_suspicious		栄伸開発株式会社
+5_20251224.csv	1643	phone_suspicious,listed_suspicious	4290001061802	株式会社グローバルギア
+6_20251224.csv	2029	listed_suspicious	2021001033448	株式会社典
+8_20251224.csv	144	phone_suspicious,listed_suspicious	9400001006492	株式会社近藤設備
