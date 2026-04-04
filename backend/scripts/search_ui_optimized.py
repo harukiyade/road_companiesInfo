@@ -9,14 +9,19 @@ SQLAlchemyを使用してSQLインジェクションを防止。
 
 import os
 import sys
+from pathlib import Path
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from sqlalchemy import create_engine, Column, String, Integer, BigInteger, Text, Date, Numeric, Boolean, ARRAY, JSONB, Index
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY
-from sqlalchemy.sql import and_, or_
 import json
+
+_backend_root = Path(__file__).resolve().parent.parent
+if str(_backend_root) not in sys.path:
+    sys.path.insert(0, str(_backend_root))
+import query_builder  # noqa: E402
 
 # ログ設定
 import logging
@@ -196,6 +201,8 @@ class SearchParams:
         industry: Optional[str] = None,
         industry_large: Optional[str] = None,
         industry_middle: Optional[str] = None,
+        industry_small: Optional[str] = None,
+        industry_detail: Optional[str] = None,
         name: Optional[str] = None,
         corporate_number: Optional[str] = None,
         limit: int = 50,
@@ -211,6 +218,8 @@ class SearchParams:
         self.industry = industry
         self.industry_large = industry_large
         self.industry_middle = industry_middle
+        self.industry_small = industry_small
+        self.industry_detail = industry_detail
         self.name = name
         self.corporate_number = corporate_number
         self.limit = limit
@@ -223,75 +232,7 @@ class SearchParams:
 def build_search_query(session: Session, params: SearchParams):
     """検索クエリを構築"""
     query = session.query(Company)
-    conditions = []
-    
-    # 都道府県
-    if params.prefecture:
-        conditions.append(Company.prefecture == params.prefecture)
-    
-    # 売上高（最小値）
-    if params.revenue_min is not None:
-        conditions.append(Company.revenue >= params.revenue_min)
-    
-    # 売上高（最大値）
-    if params.revenue_max is not None:
-        conditions.append(Company.revenue <= params.revenue_max)
-    
-    # 業種タグ（配列検索）
-    if params.industry_tags:
-        # 複数のタグのうち、いずれかが含まれている場合
-        # PostgreSQLの配列検索: tag = ANY(industries)
-        from sqlalchemy import text
-        tag_conditions = []
-        for tag in params.industry_tags:
-            # SQLAlchemyで配列検索: パラメータバインディングを使用してSQLインジェクションを防止
-            # companies.industries はテーブル名.カラム名の形式で指定
-            tag_conditions.append(
-                text(":tag = ANY(companies.industries)").bindparams(tag=tag)
-            )
-        if tag_conditions:
-            conditions.append(or_(*tag_conditions))
-    
-    # 上場区分
-    if params.listing:
-        conditions.append(Company.listing == params.listing)
-    
-    # 資本金（最小値）
-    if params.capital_stock_min is not None:
-        conditions.append(Company.capital_stock >= params.capital_stock_min)
-    
-    # 従業員数（最小値）
-    if params.employee_count_min is not None:
-        conditions.append(Company.employee_count >= params.employee_count_min)
-    
-    # 業種
-    if params.industry:
-        conditions.append(Company.industry == params.industry)
-    
-    # 業種（大分類）
-    if params.industry_large:
-        conditions.append(Company.industry_large == params.industry_large)
-    
-    # 業種（中分類）
-    if params.industry_middle:
-        conditions.append(Company.industry_middle == params.industry_middle)
-    
-    # 企業名（部分一致）
-    if params.name:
-        conditions.append(Company.name.ilike(f'%{params.name}%'))
-    
-    # 法人番号
-    if params.corporate_number:
-        conditions.append(Company.corporate_number == params.corporate_number)
-    
-    # 全ての条件をANDで結合
-    if conditions:
-        query = query.filter(and_(*conditions))
-    
-    # ソート（デフォルト: 企業名）
-    query = query.order_by(Company.name)
-    
-    return query
+    return query_builder.apply_search_filters(query, Company, params)
 
 
 def search_companies(params: SearchParams) -> Dict[str, Any]:
@@ -448,6 +389,8 @@ def handle_search_request(request_data: Dict[str, Any]) -> Dict[str, Any]:
             industry=request_data.get('industry'),
             industry_large=request_data.get('industryLarge'),
             industry_middle=request_data.get('industryMiddle'),
+            industry_small=request_data.get('industrySmall'),
+            industry_detail=request_data.get('industryDetail'),
             name=request_data.get('name'),
             corporate_number=request_data.get('corporateNumber'),
             limit=request_data.get('limit', 50),
