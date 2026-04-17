@@ -28,7 +28,9 @@ import logging
 import os
 import re
 import sys
+import types
 from collections import Counter
+from urllib.parse import urlparse
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,13 +45,16 @@ try:
 except ImportError as e:
     raise SystemExit("psycopg2 が必要です: pip install psycopg2-binary") from e
 
+BASE_DIR = Path(__file__).resolve().parent.parent
+# スクリプトの場所に依らず、常にこのリポジトリ直下の .env を指す絶対パス
+_DOTENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 try:
     from dotenv import load_dotenv
+
+    load_dotenv(dotenv_path=_DOTENV_PATH, override=True)
     load_dotenv()
 except ImportError:
     pass
-
-BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_CSV_ROOT = BASE_DIR / "fixed_csv_3"
 SUBDIRS = ("1", "2")
 
@@ -404,16 +409,332 @@ def _database_url_for_psycopg2(url: str) -> str:
         if u.startswith(prefix): return "postgresql://" + u[len(prefix) :]
     return u
 
+
+def _env_strip(key: str) -> str:
+    v = os.getenv(key)
+    if v is None:
+        return ""
+    return str(v).strip().strip('"').strip("'")
+
+
+# Cloud SQL Proxy 等のローカル転送でよく使うポート（環境変数未指定時の既定）
+_DEFAULT_PG_PORT = 5434
+
+
+def _strip_outer_quotes(s: str) -> str:
+    """先頭末尾の ' または " を繰り返し除去（.env の引用符対策）。"""
+    t = str(s).strip()
+    while len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'":
+        t = t[1:-1].strip()
+    return t
+
+
+def _read_project_root_dotenv(env_path: Path) -> Dict[str, str]:
+    """プロジェクトルート .env を常にパースして key→値（空は捨てる）。"""
+    if not env_path.is_file():
+        return {}
+    try:
+        from dotenv import dotenv_values
+    except ImportError:
+        return {}
+    out: Dict[str, str] = {}
+    for k, v in (dotenv_values(env_path) or {}).items():
+        if k is None or v is None:
+            continue
+        kk = str(k).strip()
+        sv = _strip_outer_quotes(str(v).strip().strip('"').strip("'"))
+        if sv:
+            out[kk] = sv
+    return out
+
+
+def _conn_var(key: str, file_vals: Dict[str, str]) -> str:
+    """
+    プロジェクト .env（file_vals）を os.environ より優先する。
+    シェルに誤った DATABASE_USER 等が残っていても、リポジトリ直下 .env を優先して接続できるようにする。
+    """
+    fv = file_vals.get(key)
+    if fv:
+        return _strip_outer_quotes(str(fv))
+    raw = os.environ.get(key)
+    if raw is not None and str(raw).strip() != "":
+        return _strip_outer_quotes(str(raw).strip().strip('"').strip("'"))
+    return ""
+
+
+def _mask_secret(val: Optional[str], *, label: str = "") -> str:
+    """ログ用。値の有無と長さだけ示し中身は伏せる。"""
+    if val is None:
+        return f"{label}(unset)"
+    s = str(val)
+    if not s.strip():
+        return f"{label}(empty len=0)"
+    return f"{label}set=yes len={len(s)} head_tail={s[0]!r}…{s[-1]!r}"
+
+
+def _parse_database_url_robust(url: str) -> Optional[Any]:
+    """
+    DATABASE_URL を分解する。
+
+    urllib.parse.urlparse は userinfo 内のパスワードに ``/`` が含まれると誤解析する
+    （例: ``postgresql://postgres:Legatus2000/@127.0.0.1:5434/postgres`` で username/password が None になる）。
+    その場合は ``user:password`` と ``host:port/path`` の境界を最後の ``@`` で rsplit して復元する。
+    """
+    u = _database_url_for_psycopg2(url.strip())
+    if not u:
+        return None
+    low = u.lower()
+    if not low.startswith(("postgresql://", "postgres://")):
+        p = urlparse(u)
+        return p if p.netloc else None
+    rest = u.split("://", 1)[1]
+    if "@" not in rest:
+        return urlparse(u)
+    creds, host_db = rest.rsplit("@", 1)
+    if ":" in creds:
+        user, password = creds.split(":", 1)
+    else:
+        user, password = creds, ""
+    path = "/"
+    hp = host_db
+    if "/" in host_db:
+        hp, pr = host_db.split("/", 1)
+        path = "/" + pr
+    port: Optional[int] = None
+    host = hp
+    if hp.startswith("["):
+        idx = hp.find("]:")
+        if idx != -1:
+            ps = hp[idx + 2 :]
+            if ps.isdigit():
+                host = hp[1:idx]
+                port = int(ps)
+        else:
+            host = hp.strip("[]")
+    elif ":" in hp:
+        host_part, ps = hp.rsplit(":", 1)
+        if ps.isdigit():
+            host = host_part
+            port = int(ps)
+        else:
+            host = hp
+    db_part = (path or "/").lstrip("/")
+    dbname = (db_part.split("/")[0] if db_part else "") or "postgres"
+    return types.SimpleNamespace(
+        username=user or None,
+        password=password if password is not None else None,
+        hostname=host or None,
+        port=port,
+        path=path or "/",
+        dbname_from_path=dbname,
+    )
+
+
+def _port_from_env_and_file(file_vals: Dict[str, str]) -> Optional[int]:
+    """POSTGRES_PORT 等。プロセス環境が空なら file_vals から _conn_var で解決。"""
+    for key in ("POSTGRES_PORT", "DATABASE_PORT", "PGPORT"):
+        raw = _conn_var(key, file_vals)
+        if not raw:
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            LOG.warning("環境変数 %s=%r は整数として解釈できません。無視します。", key, raw)
+    return None
+
+
+def _resolve_discrete_pg_port(file_vals: Dict[str, str]) -> int:
+    """個別パラメータ接続時のポート: .env / 環境で指定があればそれ、なければ 5434。"""
+    return _port_from_env_and_file(file_vals) or _DEFAULT_PG_PORT
+
+
+def _password_from_conn_vars(file_vals: Dict[str, str], parsed: Optional[Any]) -> str:
+    """パスワード: 個別変数 → DATABASE_URL 分解結果の順。"""
+    for key in ("POSTGRES_PASSWORD", "DATABASE_PASS", "DB_PASSWORD", "PGPASSWORD"):
+        s = _conn_var(key, file_vals)
+        if s:
+            return s
+    if parsed is not None and parsed.password is not None:
+        return _strip_outer_quotes(str(parsed.password))
+    return ""
+
+
+def _user_from_conn_vars(file_vals: Dict[str, str], parsed: Optional[Any]) -> str:
+    """ユーザー: 個別変数が空なら DATABASE_URL の username を os の USER より先に使う。"""
+    u = _conn_var("POSTGRES_USER", file_vals) or _conn_var("DATABASE_USER", file_vals)
+    if u:
+        return u
+    if parsed is not None and parsed.username:
+        return str(parsed.username)
+    return (
+        _env_strip("USER")
+        or _env_strip("LOGNAME")
+        or "postgres"
+    )
+
+
+def _host_is_localhost_for_proxy_port(host: str) -> bool:
+    """要件: 127.0.0.1 または localhost のときプロキシポート 5434 を強制する。"""
+    if not host:
+        return False
+    h = host.lower().strip("[]")
+    return h in ("127.0.0.1", "localhost")
+
+
 def get_connection():
-    url = os.getenv("DATABASE_URL")
-    if url: return psycopg2.connect(_database_url_for_psycopg2(url))
+    """
+    PostgreSQL へ接続する。
+
+    - ``Path(__file__).resolve().parent.parent / ".env"`` を load_dotenv + dotenv_values で読む。
+    - 接続用の値は **プロジェクト .env（file_vals）を os.environ より優先**（_conn_var）。
+    - ``DATABASE_URL`` のパスワードに ``/`` が含まれる場合、urllib.parse.urlparse は壊れるため
+      ``_parse_database_url_robust``（最後の ``@`` で rsplit）を使う。
+    - psycopg2.connect は host / port / user / password / dbname のキーワード引数のみ。
+    - host が 127.0.0.1 または localhost のとき port は 5434 に固定。
+    """
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    abs_env = str(env_path.resolve())
+    LOG.info(
+        "load_dotenv 対象: path=%r os.path.exists=%s",
+        abs_env,
+        os.path.exists(abs_env),
+    )
+    try:
+        from dotenv import find_dotenv, load_dotenv
+
+        try:
+            fd = find_dotenv(usecwd=True)
+        except TypeError:
+            fd = find_dotenv()
+        LOG.info(
+            "dotenv find_dotenv (cwd 探索) -> %r exists=%s",
+            fd,
+            bool(fd) and os.path.exists(fd),
+        )
+        load_dotenv(dotenv_path=env_path, override=True)
+        load_dotenv()
+    except ImportError:
+        LOG.warning("python-dotenv 未インストール。pip install python-dotenv を推奨します。")
+    except Exception as ex:
+        LOG.warning("load_dotenv 中に例外: %s", ex)
+
+    file_vals = _read_project_root_dotenv(env_path)
+    LOG.info(
+        "カレントの .env: exists=%s abspath=%r",
+        os.path.exists(".env"),
+        os.path.abspath(".env"),
+    )
+    LOG.info(
+        "プロジェクトルート .env: path=%r is_file=%s file_vals キー数=%d keys=%s",
+        abs_env,
+        env_path.is_file(),
+        len(file_vals),
+        sorted(file_vals.keys()),
+    )
+    LOG.info(
+        "load_dotenv 直後 os.environ: DATABASE_PASS %s | POSTGRES_PASSWORD %s | POSTGRES_USER %r | DATABASE_USER %r",
+        _mask_secret(os.environ.get("DATABASE_PASS")),
+        _mask_secret(os.environ.get("POSTGRES_PASSWORD")),
+        os.environ.get("POSTGRES_USER"),
+        os.environ.get("DATABASE_USER"),
+    )
+    if "DATABASE_PASS" in file_vals:
+        LOG.info("file_vals DATABASE_PASS %s", _mask_secret(file_vals.get("DATABASE_PASS")))
+
+    url = _conn_var("DATABASE_URL", file_vals)
+    if url:
+        naive = urlparse(_database_url_for_psycopg2(url))
+        LOG.info(
+            "【比較】urllib.parse.urlparse: netloc=%r username=%r password_none=%s path=%r "
+            "(パスワードに / があると user/pass が None になり得る)",
+            naive.netloc,
+            naive.username,
+            naive.password is None,
+            naive.path,
+        )
+    parsed: Optional[Any] = _parse_database_url_robust(url) if url else None
+    if parsed is not None:
+        LOG.info(
+            "【採用】robust parse: hostname=%r port=%r username=%r %s path=%r",
+            getattr(parsed, "hostname", None),
+            getattr(parsed, "port", None),
+            getattr(parsed, "username", None),
+            _mask_secret(getattr(parsed, "password", None)),
+            getattr(parsed, "path", None),
+        )
+
+    keepalive_kwargs = dict(
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=5,
+    )
+    sslmode = _conn_var("POSTGRES_SSLMODE", file_vals) or _conn_var("DATABASE_SSLMODE", file_vals) or "prefer"
+    explicit_host = _conn_var("POSTGRES_HOST", file_vals) or _conn_var("DATABASE_HOST", file_vals)
+    p_env = _port_from_env_and_file(file_vals)
+
+    if url and parsed is not None:
+        if hasattr(parsed, "dbname_from_path"):
+            db_from_url = str(parsed.dbname_from_path)
+        else:
+            pth = (getattr(parsed, "path", "") or "").lstrip("/")
+            db_from_url = (pth.split("/")[0] if pth else "") or "postgres"
+
+        user = _user_from_conn_vars(file_vals, parsed)
+        password = _password_from_conn_vars(file_vals, parsed)
+
+        dbname = _conn_var("POSTGRES_DB", file_vals) or _conn_var("DATABASE_NAME", file_vals) or db_from_url
+        host = explicit_host or (parsed.hostname or "127.0.0.1")
+        host = str(host).strip()
+
+        if _host_is_localhost_for_proxy_port(host):
+            port = 5434
+        else:
+            port = p_env if p_env is not None else (parsed.port if parsed.port is not None else 5432)
+
+        LOG.info(
+            "【接続直前】今まさに psycopg2.connect しようとしています (DATABASE_URL 分岐): "
+            "host=%r port=%r user=%r dbname=%r %s",
+            host,
+            port,
+            user,
+            dbname,
+            _mask_secret(password, label="password "),
+        )
+        return psycopg2.connect(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            dbname=dbname,
+            sslmode=sslmode,
+            **keepalive_kwargs,
+        )
+
+    host = explicit_host or "127.0.0.1"
+    host = str(host).strip()
+    port = _resolve_discrete_pg_port(file_vals)
+    user = _user_from_conn_vars(file_vals, None)
+    password = _password_from_conn_vars(file_vals, None)
+    dbname = _conn_var("POSTGRES_DB", file_vals) or _conn_var("DATABASE_NAME", file_vals) or "postgres"
+
+    LOG.info(
+        "【接続直前】今まさに psycopg2.connect しようとしています (個別変数のみ): "
+        "host=%r port=%r user=%r dbname=%r %s",
+        host,
+        port,
+        user,
+        dbname,
+        _mask_secret(password, label="password "),
+    )
     return psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
-        port=int(os.getenv("POSTGRES_PORT", "5432")),
-        user=os.getenv("POSTGRES_USER", "postgres"),
-        password=os.getenv("POSTGRES_PASSWORD", ""),
-        dbname=os.getenv("POSTGRES_DB", "postgres"),
-        sslmode=os.getenv("POSTGRES_SSLMODE", "prefer"),
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        dbname=dbname,
+        sslmode=sslmode,
+        **keepalive_kwargs,
     )
 
 def fetch_companies_np(cur) -> List[Dict[str, Any]]:

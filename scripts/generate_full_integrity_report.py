@@ -4,6 +4,11 @@
 fixed_csv_3/unit_million・unit_yen 配下の全CSVをスキャンし、
 UIテストで判明したデータズレ・フォーマット異常・マッピング漏れ等をカテゴリ別に洗い出す。
 
+companies テーブル全件の DB データ品質調査（キーセットページネーション）:
+
+  python scripts/generate_full_integrity_report.py --companies-db-integrity
+  # または: python scripts/companies_db_integrity_scan.py
+
 出力先: reports/full_integrity_YYYYMMDD_HHMMSS/
 
   python scripts/generate_full_integrity_report.py           # CSV + DB突合（要 POSTGRES_PASSWORD）
@@ -948,11 +953,24 @@ def parse_args():
         action="store_true",
         help="tqdm を使わず、ファイルごとの print のみで進捗表示",
     )
+    p.add_argument(
+        "--companies-db-integrity",
+        action="store_true",
+        help="companies テーブル全件のデータ品質レポートのみ実行（CSV フェーズはスキップ）",
+    )
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    if getattr(args, "companies_db_integrity", False):
+        sys.path.insert(0, str(SCRIPT_DIR))
+        from companies_db_integrity_scan import run_companies_db_integrity_report
+
+        scan_argv = [a for a in sys.argv[1:] if a != "--companies-db-integrity"]
+        run_companies_db_integrity_report(scan_argv)
+        return
+
     csv_only = args.csv_only
     max_rows = max(0, args.max_rows_per_file)
     use_tqdm = not args.no_tqdm and _HAS_TQDM
