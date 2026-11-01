@@ -1,3 +1,5 @@
+
+
 <<<<<<< HEAD
 node_modules/
 dist/
@@ -94,3 +96,9 @@ git push
 !.env.example
 pref/00_zenkoku_all_20251226.zip
 >>>>>>> b08347e46f27f01efa3b8926d61656398aecebee
+
+enrichment_state.db
+*.jsonl
+output/
+enrichment_state.db-shm
+enrichment_state.db-wal
